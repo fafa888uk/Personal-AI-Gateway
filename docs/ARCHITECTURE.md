@@ -82,6 +82,10 @@
   PostgreSQL（生产迁移）下通过测试，不得写 SQLite 专属 SQL 进迁移。
 - 部署验证（Compose 构建、容器健康检查）只能在有 Docker 的环境
   或目标服务器上做，本地记为受限项，不得谎称已验证。
+- Flutter SDK 已在阶段 C 安装：3.50.0 stable，`~/flutter`（不在
+  PATH，用前 export）；`flutter analyze` / `flutter test` / 集成
+  测试均已通过（见 `docs/STATUS.md` 阶段 C 记录）；Linux 桌面构建
+  成功。出包仍走 GitHub Actions（iOS/macOS/Windows 本地不编）。
 
 ## 4. 核心网关（阶段 B）
 
@@ -231,9 +235,9 @@
   下次打开自动拿到新版），随阶段 D 第一版交付。
 - 原生 IPA：用户自签，交付未签名包（CI macOS runner 上 xcodebuild
   无签名编译 .app 再打包 .ipa；我方不提供签名证书或账号）；自签
-  安装步骤按用户已有侧载方式写，以实际验证为准；第一版形态首选
-  WKWebView 壳 + 网页聊天（不得夸大原生程度），原生 SwiftUI 为后续
-  可选；PWA 先行，IPA 不阻塞网关与网页聊天。
+  安装步骤按用户已有侧载方式写，以实际验证为准；第一版形态为
+  Flutter 客户端（阶段 C 已交付，与 Windows/macOS 共用一套代码）；
+  PWA 先行，IPA 不阻塞网关与网页聊天。
 - 电脑端入口（桌面浏览器网页、Codex CLI、VS Code 扩展）共用同一套
   网关鉴权与模型配置；另有 Flutter 桌面客户端（Windows .exe +
   macOS .dmg，与 iOS 共用一套代码），范围先对齐聊天 + 模型切换 +
@@ -248,22 +252,28 @@
 新服务器承担六件事：**统一 API 中转、模型管理、历史聊天、设备同步、
 客户端鉴权、更新信息**。客户端只做展示与输入，不自带服务端能力。
 
-### 13.1 历史聊天与设备同步
+### 13.1 历史聊天与设备同步（阶段 C 已实现 v1 契约）
 
-- 历史聊天存在服务端（已有 `chat_sessions` / `chat_messages` 设计）。
-- 设备同步 = 同一管理员账号在 iPhone、Windows、macOS、网页四端看到
-  同一份对话记录：新建/改名/删除/消息写入都要能同步到其他设备。
-- 同步方式：**服务端为准，按时间戳合并冲突**。
-  - 每条会话与消息有服务端时间戳（`updated_at`）与服务端序列；
-    客户端同步时按“自上次同步时间戳之后的变化”拉取增量。
-  - 冲突合并在消息粒度做：两端各自新增的消息都保留，按时间戳排序；
-    同一条记录两端都改，以服务端最新 `updated_at` 为准。
-  - 删除用 tombstone（`deleted_at`）传播，删除不会因为另一端旧数据
-    同步回来而复活。
-- 离线时的表现：离线可看本地缓存、可写本地草稿与待发送队列；恢复
-  联网后先把本地写入推上去、再拉服务端增量；**不得出现两端数据
-  互相覆盖丢记录**——任何同步失败都必须保留本地未同步内容并明确
-  提示，不静默丢弃。
+- 历史聊天存在服务端：`chat_sessions` / `chat_messages` 表
+  （migration `0002_chat_history`，阶段 C 落地）+ 客户端密钥隔离
+  的接口（见下）。`api_request_logs` 仍不存 prompt 内容；消息内容
+  只存在 `chat_messages` 里（同步存储本身，可按会话删除）。
+- v1 接口（全部要客户端密钥，只能看到自己的会话，别人的返回 404）：
+  `POST /api/v1/chats`、`GET /api/v1/chats`（按 `updated_at` 倒序）、
+  `GET /api/v1/chats/{id}`、`PATCH /api/v1/chats/{id}`（改名/改模型）、
+  `DELETE /api/v1/chats/{id}`（服务端硬删除）、
+  `GET /api/v1/chats/{id}/messages`、
+  `POST /api/v1/chats/{id}/messages`（role/content/model/tokens）。
+  另有 `GET /api/v1/usage/summary?period=today|month`（仅调用方密钥
+  的服务端汇总，cost_status 如实报告）。
+- v1 同步方式：**服务端为准，全量拉取**——客户端打开会话列表与
+  下拉刷新时调 `GET /api/v1/chats` 拿全量；新建/改名/删除/消息写
+  入都直接调服务端接口，成功后刷新列表。同一账号在各端看到同一份
+  记录（服务端同一份数据）。
+- **未实现（不得谎称已有）**：增量同步（按时间戳拉变化）、删除
+  tombstone、离线缓存/草稿/待发送队列。当前离线时客户端无法同步，
+  删除为硬删除。以上随网页聊天（阶段 D）或后续阶段再补，补之前
+  文档保持这个口径。
 - 同一管理员账号登录即同步；不同设备不共享官方 Key（见 §13.3）。
 
 ### 13.2 更新信息接口

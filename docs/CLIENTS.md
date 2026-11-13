@@ -28,6 +28,12 @@
   为 **Flutter 客户端**（与 Windows/macOS 共用一套代码），此前
   “WKWebView 壳 + 网页聊天首选”的决定已被 Flutter 路线取代；
   PWA 仍是第一版先行的 iPhone 入口，IPA 不阻塞网关和网页聊天。
+- 【2026-11-14 阶段 C 已交付】Flutter 客户端 v0.1.0（`apps/flutter`）：
+  登录、流式聊天 + 停止、模型切换、服务端历史同步、用量统计、
+  版本检测与更新入口、设置中心。本地验证：`flutter analyze`
+  通过、`flutter test` 24 passed、mock 网关集成测试通过
+  （见 `docs/STATUS.md` 阶段 C 记录）。IPA 本身仍未编过——出包走
+  GitHub Actions（步骤 5），未经真机安装测试前只记“仅构建验证”。
 
 ## 3. 桌面与三端客户端：Flutter（Windows .exe + macOS .dmg + iOS .ipa，共用一套代码）
 
@@ -38,6 +44,8 @@
 - 构建一律走 GitHub Actions：macOS runner 出 IPA/DMG，Windows
   runner 出 EXE；各 runner 的前置条件（Flutter SDK 版本、Xcode
   版本、Windows 构建工具链）写进 CI 工作流文档，以实际跑通为准。
+  本地只验证到 `flutter build linux --debug` 成功 + analyze / test /
+  集成测试通过；iOS/macOS/Windows 包本地没编过。
 - 版本检测 + 更新包下载做进桌面应用里：启动/定期查服务端版本
   信息接口（见 §5），有新版则提示并下载更新包；分发走
   GitHub Releases。
