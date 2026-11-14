@@ -78,10 +78,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Node.js 20
+      # Node 24 (not 20): vitest 4.0.8 + Node 20 hangs on the jsdom
+      # component tests (Vite servers never close; reproduced locally —
+      # Node 20.19 full suite hangs, Node 24.22 passes in ~9s).
+      # Local dev runs Node 24.22.1; keep CI on the same major.
+      - name: Set up Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - name: Install dependencies
