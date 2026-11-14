@@ -77,7 +77,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # added (stdout behaviour is unchanged otherwise).
 configure_logging(logger, log_file_from_env())
 
-VERSION = "0.3.0"
+# Release version, unified at v0.1.0 (see ARCHITECTURE.md §14: the release
+# tag is the single version source). Returned by /api/health ("version")
+# and by GET /api/v1/app/version ("gateway_version").
+VERSION = "0.1.0"
 MAX_RETRIES = 2  # initial attempt + 2 retries, only before streaming starts
 
 
