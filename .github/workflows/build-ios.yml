@@ -199,7 +199,7 @@ jobs:
       - name: Upload to GitHub Release
         run: |
           set -euo pipefail
-          cd release-assets
+          cd release-assets/apps/flutter
           TAG="${GITHUB_REF#refs/tags/}"
           SHA="$(cut -d' ' -f1 checksums.txt)"
           cat > NOTES.md <<EOF
