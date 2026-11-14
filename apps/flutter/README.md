@@ -3,7 +3,7 @@
 一套代码，三个平台：iOS / iPadOS、Windows、macOS 共用同一套界面与
 功能代码。网页端见 `apps/web`（Next.js），后端见 `apps/api`（FastAPI）。
 
-## 功能（v0.1.3）
+## 功能（v0.1.4）
 
 - 账号登录：服务器地址 + 客户端密钥（`pag_sk_…`，Bearer 鉴权），
   “测试连接”调 `GET /v1/models` 真实验证，不造假。

@@ -60,7 +60,7 @@ npm run typecheck  # tsc --noEmit
   model: a dollar figure is shown only when `cost_status` is "ok").
 - `src/lib/theme.ts` — light/dark toggle persisted in localStorage
   (`pag.theme`), defaulting to the OS preference.
-- `src/lib/version.ts` — `WEB_VERSION` ("0.1.3", matches package.json),
+- `src/lib/version.ts` — `WEB_VERSION` ("0.1.4", matches package.json),
   compared against the server-reported `web` release by VersionBanner.
 - UsageBar: today + month from GET /api/v1/usage/summary; cost is
   shown only when exact, otherwise the Flutter status label.

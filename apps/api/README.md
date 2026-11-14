@@ -253,7 +253,7 @@ before login) returns per-platform release info for the online-update
 system:
 
 ```json
-{"configured": true, "version": "1.0.0", "gateway_version": "0.1.3",
+{"configured": true, "version": "1.0.0", "gateway_version": "0.1.4",
  "platforms": {"ios": {"version": "1.0.0", "release_date": "2026-11-14",
  "download_url": "https://github.com/fafa920q-hue/Personal-AI-Gateway/releases/download/v1.0.0/PersonalAI-1.0.0-ios-unsigned.ipa",
  "sha256": "<sha256>", "release_notes": "..."}, "windows": {}, "macos": {}, "web": {}}}
