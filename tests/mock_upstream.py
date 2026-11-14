@@ -144,6 +144,15 @@ class MockUpstream:
         if path in status_override:
             return error_response(int(status_override[path]))
 
+        if request.method == "GET" and path == "/models":
+            return httpx.Response(200, json={
+                "object": "list",
+                "data": [
+                    {"id": "gpt-5.4-mini", "object": "model", "created": 1763000000, "owned_by": "mock"},
+                    {"id": "gpt-5.4-nano", "object": "model", "created": 1763000000, "owned_by": "mock"},
+                    {"id": "gpt-upstream-only", "object": "model", "created": 1763000000, "owned_by": "mock"},
+                ],
+            })
         if request.method == "POST" and path == "/responses":
             model = body.get("model", "gpt-5.4-mini")
             if body.get("stream") is True:

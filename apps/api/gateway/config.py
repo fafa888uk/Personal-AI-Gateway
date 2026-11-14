@@ -49,9 +49,17 @@ class Settings:
     database_url: str = ""
     database_url_dev: str = "sqlite:///./data/dev.db"
     admin_username: str = "admin"
+    # Admin console password (env ADMIN_PASSWORD). Only the Argon2id hash
+    # is ever stored (see db.seed_admin); plaintext is never logged.
+    # Empty => no admin account is seeded and /api/v1/admin/login 503s.
+    admin_password: str = ""
     # Admin API key for /admin/* endpoints. Never doubles as a client key.
     # Empty => admin endpoints return 503 until configured.
     admin_key: str = ""
+    # Set the Secure flag on the admin session cookie (HTTPS deployments).
+    session_cookie_secure: bool = False
+    # Admin session lifetime in hours (cookie max-age + DB expiry).
+    admin_session_hours: float = 12.0
     budget_global_daily_usd: float = 5.0
     budget_global_monthly_usd: float = 50.0
     budget_client_monthly_usd: float = 20.0
@@ -94,7 +102,12 @@ class Settings:
                 "DATABASE_URL_DEV", "sqlite:///./data/dev.db"
             ),
             admin_username=os.environ.get("ADMIN_USERNAME", "admin"),
+            admin_password=os.environ.get("ADMIN_PASSWORD", ""),
             admin_key=os.environ.get("GATEWAY_ADMIN_KEY", ""),
+            session_cookie_secure=os.environ.get(
+                "SESSION_COOKIE_SECURE", ""
+            ).lower() in ("1", "true", "yes"),
+            admin_session_hours=_float("ADMIN_SESSION_HOURS", 12.0),
             budget_global_daily_usd=_float("BUDGET_GLOBAL_DAILY_USD", 5.0),
             budget_global_monthly_usd=_float("BUDGET_GLOBAL_MONTHLY_USD", 50.0),
             budget_client_monthly_usd=_float("BUDGET_CLIENT_MONTHLY_USD", 20.0),

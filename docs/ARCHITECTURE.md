@@ -207,6 +207,17 @@
   `usage_records`、`pricing_rules`、`system_settings`、
   `audit_events`。Alembic 迁移、索引、数据保留与清理策略；对话内容
   是否保存可配置，默认优先保护隐私。
+- 管理后台（阶段 E 已实现，见 STATUS.md）：单管理员账号（Argon2id，
+  启动时从 `ADMIN_USERNAME` + `ADMIN_PASSWORD` 种子）+ 会话 Cookie
+  （HttpOnly SameSite=Lax，12h）+ 双提交 CSRF + 登录失败限流（5 次 /
+  15 分钟）；规范管理 API `/api/v1/admin/*`（模型/密钥/用量/诊断/
+  设置/审计）；旧 bearer `/admin/*` 保留兼容。Web 管理控制台
+  `apps/web/src/app/admin/*` 通过 `src/lib/admin.ts` 调用；该文件集中
+  归一化后端响应信封（嵌套 capabilities/tokens、per_*/pricing_rules、
+  `{id}` upstream 条目、cost 明细对象）为页面用的平铺形状——后端与
+  前端字段名不一致时只改归一化层，不改后端 API。已知缺口：持久化到
+  `system_settings` 的全局预算尚未接入 `/v1/*` 请求时强制（只上报），
+  接线是后续工作。
 - 备份与恢复脚本 + 真实恢复演练（有证据的演练记录）。
 
 ## 10. 部署

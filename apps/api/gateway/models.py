@@ -71,6 +71,12 @@ class ClientKey(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     # Irreversible SHA-256 hex digest of the raw key. Raw key is never stored.
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # First 12 chars of the raw key at creation (e.g. "pag_sk_aB3..."),
+    # for display only; the raw key itself is never stored.
+    key_prefix: Mapped[str | None] = mapped_column(String(16))
+    # Client kind: "web" | "codex" | "vscode" | "other" (nullable for
+    # keys created before Stage E).
+    client_type: Mapped[str | None] = mapped_column(String(32))
     # Canonical model names this client may call; ["*"] means any
     # verified-enabled model. Empty list means no models.
     allowed_models: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
@@ -194,4 +200,65 @@ class ChatMessage(Base):
     tokens_out: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class AdminAccount(Base):
+    """Stage E: the single admin console account.
+
+    The password is stored ONLY as an Argon2id hash. Plaintext is never
+    stored or logged. Seeded once at startup from ADMIN_USERNAME +
+    ADMIN_PASSWORD (see db.seed_admin); if the table is non-empty the
+    env password is never re-hashed or overwritten.
+    """
+
+    __tablename__ = "admin_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class AdminSession(Base):
+    """Stage E: an admin console login session.
+
+    Only the SHA-256 digest of the opaque session token is stored; the
+    raw token lives only in the HttpOnly pag_admin cookie. The CSRF
+    token is stored in plaintext (double-submit pattern: it is not a
+    credential on its own — it must match the session).
+    """
+
+    __tablename__ = "admin_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("admin_accounts.id"), nullable=False
+    )
+    session_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    csrf_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class SystemSetting(Base):
+    """Stage E: admin-persisted key/value settings (JSON values).
+
+    Keys: "budget_global_daily_usd", "budget_global_monthly_usd",
+    "retention_days". Env vars remain the defaults when no row exists.
+    """
+
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )

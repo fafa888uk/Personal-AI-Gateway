@@ -21,6 +21,8 @@ from gateway.models import ClientKey, ModelRegistry, PricingRule, UsageRecord  #
 from mock_upstream import MockUpstream  # noqa: E402
 
 ADMIN_KEY = "test-admin-key-123"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "test-admin-pass-1"
 MODEL = "gpt-5.4-mini"
 MODEL2 = "gpt-5.4-nano"
 
@@ -32,6 +34,8 @@ def settings(tmp_path):
         openai_base_url="https://api.openai.com/v1",
         database_url="",
         database_url_dev=f"sqlite:///{tmp_path}/test.db",
+        admin_username=ADMIN_USERNAME,
+        admin_password=ADMIN_PASSWORD,
         admin_key=ADMIN_KEY,
         budget_global_daily_usd=5.0,
         budget_global_monthly_usd=50.0,

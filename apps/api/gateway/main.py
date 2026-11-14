@@ -15,13 +15,15 @@ No other cancel/compress endpoints are implemented: nothing is guessed.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import math
 import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -33,13 +35,19 @@ from . import budgets as budget_mod
 from .auth import (
     client_may_call_model,
     generate_client_key,
+    generate_csrf_token,
+    generate_session_token,
     hash_client_key,
+    hash_session_token,
     verify_admin_key,
+    verify_admin_password,
     verify_client_key,
 )
 from .config import Settings, load_dotenv
 from .db import init_db, list_verified_models, resolve_model
 from .models import (
+    AdminAccount,
+    AdminSession,
     ApiRequestLog,
     AuditEvent,
     ChatMessage,
@@ -47,6 +55,7 @@ from .models import (
     ClientKey,
     ModelRegistry,
     PricingRule,
+    SystemSetting,
     UsageRecord,
 )
 from .upstream import (
@@ -108,6 +117,7 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         app.state.session_factory = init_db(settings)
         app.state.rate_windows: dict[int, deque] = {}
         app.state.semaphores: dict[int, asyncio.Semaphore] = {}
+        app.state.login_attempts: dict[tuple[str, str], deque] = {}
         yield
 
     app = FastAPI(title="Personal AI Gateway", version=VERSION, lifespan=lifespan)
@@ -115,10 +125,15 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
     app.state.transport = transport
     app.state.rate_windows = {}
     app.state.semaphores = {}
+    app.state.login_attempts = {}
 
     @app.exception_handler(_Unauthorized)
     async def _unauthorized_handler(request: Request, exc: _Unauthorized):
         return gateway_error(401, "invalid_client_key", exc.message)
+
+    @app.exception_handler(_AdminUnauthorized)
+    async def _admin_unauthorized_handler(request: Request, exc: _AdminUnauthorized):
+        return gateway_error(401, "admin_unauthorized", exc.message)
 
     @app.exception_handler(_Forbidden)
     async def _forbidden_handler(request: Request, exc: _Forbidden):
@@ -258,12 +273,11 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         return {"status": "ok", "service": "personal-ai-gateway", "version": VERSION, "db": db_status}
 
     # ------------------------------------------------------------ app version
-    @app.get("/api/v1/app/version")
-    def app_version():
-        """Public release info for clients' update checks.
+    def _version_payload() -> dict:
+        """Release info for clients' update checks (shared by the public
+        version endpoint and the admin settings endpoint).
 
         Server-side source only (APP_VERSION / APP_RELEASE_INFO_JSON env).
-        Clients must never hardcode versions or embed a GitHub PAT.
         Unconfigured => honestly reports configured=false, never fake data.
         """
         info: dict = {}
@@ -292,6 +306,16 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
                     "note": "no release configured on this server"}
         return {"configured": True, "version": version,
                 "gateway_version": VERSION, "platforms": clean}
+
+    @app.get("/api/v1/app/version")
+    def app_version():
+        """Public release info for clients' update checks.
+
+        Server-side source only (APP_VERSION / APP_RELEASE_INFO_JSON env).
+        Clients must never hardcode versions or embed a GitHub PAT.
+        Unconfigured => honestly reports configured=false, never fake data.
+        """
+        return _version_payload()
 
     # ------------------------------------------------------------ /v1/models
     @app.get("/v1/models")
@@ -798,30 +822,28 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         rows = db.query(ModelRegistry).order_by(ModelRegistry.sort_order).all()
         return {"models": [_model_view(r) for r in rows]}
 
-    @app.post("/admin/models/{canonical}/verify")
-    async def admin_verify_model(canonical: str, request: Request, db: Session = Depends(get_db)):
-        require_admin(request)
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        mode = (payload or {}).get("mode", "real")
+    # Shared model verification (used by legacy /admin/* and new
+    # /api/v1/admin/*). Returns (error_response, row, http_status, method);
+    # exactly one of error_response / row is set. verification_method is
+    # "real" only for a real upstream call, "mock-test-only" for the mock
+    # path. This sends a real request and may incur API cost in real mode.
+    async def _verify_model(canonical: str, db: Session, mode: str):
         row = db.query(ModelRegistry).filter(ModelRegistry.canonical_name == canonical).first()
         if row is None:
-            return gateway_error(404, "model_not_found", f"unknown model: {canonical}")
+            return gateway_error(404, "model_not_found", f"unknown model: {canonical}"), None, None, None
         if mode == "mock":
             if not settings.allow_mock_verify:
                 return gateway_error(
                     403, "mock_not_allowed",
                     "mock verification is a test-only path and is not enabled on this server",
-                )
+                ), None, None, None
             method = "mock-test-only"
         elif mode == "real":
             if not settings.openai_api_key:
-                return gateway_error(503, "no_upstream_key", "no real upstream API key is configured")
+                return gateway_error(503, "no_upstream_key", "no real upstream API key is configured"), None, None, None
             method = "real"
         else:
-            return gateway_error(400, "invalid_request", "mode must be 'real' or 'mock'")
+            return gateway_error(400, "invalid_request", "mode must be 'real' or 'mock'"), None, None, None
         upstream_client = build_upstream_client(settings, app.state.transport)
         try:
             req = upstream_client.build_request(
@@ -848,6 +870,19 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         db.commit()
         audit("model_verified",
               f"model={canonical} status={row.verification_status} method={method} http={status}")
+        return None, row, status, method
+
+    @app.post("/admin/models/{canonical}/verify")
+    async def admin_verify_model(canonical: str, request: Request, db: Session = Depends(get_db)):
+        require_admin(request)
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        mode = (payload or {}).get("mode", "real")
+        err, row, status, method = await _verify_model(canonical, db, mode)
+        if err is not None:
+            return err
         return {"model": _model_view(row), "verification_http_status": status,
                 "note": "Mock verification is NOT real verification." if method == "mock-test-only" else None}
 
@@ -863,6 +898,7 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         row = ClientKey(
             name=str(payload.get("name", "client")),
             key_hash=hash_client_key(raw),
+            key_prefix=raw[:12],
             allowed_models=payload.get("allowed_models", ["*"]),
             rate_limit_per_min=int(payload.get("rate_limit_per_min", settings.default_rate_limit_per_min)),
             concurrency_limit=int(payload.get("concurrency_limit", settings.default_concurrency_limit)),
@@ -880,6 +916,833 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
     def admin_budgets(request: Request, db: Session = Depends(get_db)):
         require_admin(request)
         return budget_mod.budget_status(db, settings)
+
+    # ================================================================
+    # Stage E — admin console API (/api/v1/admin/*)
+    #
+    # Cookie-session auth (AdminAccount/AdminSession), NOT the bearer
+    # admin key: the bearer key keeps working only on legacy /admin/*.
+    # Mutating endpoints additionally require double-submit CSRF.
+    # Nothing here ever logs or returns passwords, raw keys or tokens.
+    # ================================================================
+    ADMIN_SESSION_COOKIE = "pag_admin"
+    ADMIN_CSRF_COOKIE = "pag_csrf"
+    LOGIN_MAX_FAILURES = 5
+    LOGIN_WINDOW_S = 15 * 60  # 15 minutes
+    VALID_CLIENT_TYPES = {"web", "codex", "vscode", "other"}
+    DEFAULT_RETENTION_DAYS = 90
+
+    def _now_aware() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _as_aware(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    def _iso(value: datetime | None) -> str | None:
+        value = _as_aware(value)
+        return value.isoformat() if value else None
+
+    def _session_max_age_s() -> int:
+        return max(60, int(settings.admin_session_hours * 3600))
+
+    def _set_session_cookie(resp: JSONResponse, raw_token: str) -> None:
+        resp.set_cookie(
+            ADMIN_SESSION_COOKIE, raw_token, max_age=_session_max_age_s(),
+            path="/", httponly=True, samesite="lax",
+            secure=settings.session_cookie_secure,
+        )
+
+    def _set_csrf_cookie(resp: JSONResponse, csrf_token: str, max_age: int | None = None) -> None:
+        resp.set_cookie(
+            ADMIN_CSRF_COOKIE, csrf_token,
+            max_age=max_age if max_age is not None else _session_max_age_s(),
+            path="/", httponly=False, samesite="lax",
+            secure=settings.session_cookie_secure,
+        )
+
+    def _admin_session(request: Request, db: Session):
+        """Return (account, session_row) for a valid pag_admin cookie, else (None, None)."""
+        raw = request.cookies.get(ADMIN_SESSION_COOKIE)
+        if not raw:
+            return None, None
+        row = (
+            db.query(AdminSession)
+            .filter(AdminSession.session_token_hash == hash_session_token(raw))
+            .first()
+        )
+        if row is None:
+            return None, None
+        expires = _as_aware(row.expires_at)
+        if expires is None or expires <= _now_aware():
+            db.delete(row)
+            db.commit()
+            return None, None
+        account = db.query(AdminAccount).filter(AdminAccount.id == row.account_id).first()
+        if account is None:
+            return None, None
+        row.last_seen_at = _now_aware()
+        db.commit()
+        return account, row
+
+    def require_admin_session(request: Request, db: Session):
+        account, session_row = _admin_session(request, db)
+        if account is None or session_row is None:
+            raise _AdminUnauthorized("admin session required")
+        return account, session_row
+
+    def require_csrf(request: Request, session_row: AdminSession) -> None:
+        header = request.headers.get("x-csrf-token", "")
+        cookie = request.cookies.get(ADMIN_CSRF_COOKIE, "")
+        if (
+            not header
+            or not hmac.compare_digest(header, session_row.csrf_token)
+            or not hmac.compare_digest(cookie, session_row.csrf_token)
+        ):
+            raise _Forbidden("csrf_invalid", "missing or invalid CSRF token")
+
+    # ---- login rate limiting (in-memory, per client IP + username) ----
+    def _login_key(request: Request, username: str) -> tuple[str, str]:
+        ip = request.client.host if request.client else "unknown"
+        return (ip, username)
+
+    def _prune_login_attempts(key: tuple[str, str]) -> deque:
+        window = app.state.login_attempts.setdefault(key, deque())
+        cutoff = time.monotonic() - LOGIN_WINDOW_S
+        while window and window[0] <= cutoff:
+            window.popleft()
+        return window
+
+    def _login_blocked(key: tuple[str, str]) -> bool:
+        return len(_prune_login_attempts(key)) >= LOGIN_MAX_FAILURES
+
+    def _record_login_failure(key: tuple[str, str]) -> None:
+        _prune_login_attempts(key).append(time.monotonic())
+
+    def _clear_login_failures(key: tuple[str, str]) -> None:
+        app.state.login_attempts.pop(key, None)
+
+    # ---- persisted settings (SystemSetting overrides env defaults) ----
+    def _get_setting(db: Session, key: str, default):
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        return row.value if row is not None else default
+
+    def _set_setting(db: Session, key: str, value) -> None:
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if row is None:
+            db.add(SystemSetting(key=key, value=value))
+        else:
+            row.value = value
+
+    def _effective_budgets(db: Session) -> tuple[float, float]:
+        return (
+            float(_get_setting(db, "budget_global_daily_usd", settings.budget_global_daily_usd)),
+            float(_get_setting(db, "budget_global_monthly_usd", settings.budget_global_monthly_usd)),
+        )
+
+    def _effective_retention_days(db: Session) -> int:
+        return int(_get_setting(db, "retention_days", DEFAULT_RETENTION_DAYS))
+
+    def _client_key_view(r: ClientKey) -> dict:
+        prefix = r.key_prefix or (r.key_hash[:8] if r.key_hash else None)
+        return {
+            "id": r.id,
+            "name": r.name,
+            "key_prefix": prefix,
+            "type": r.client_type,
+            "client_type": r.client_type,
+            "allowed_models": r.allowed_models or [],
+            "rate_limit_per_min": r.rate_limit_per_min,
+            "concurrency_limit": r.concurrency_limit,
+            "monthly_budget_usd": r.monthly_budget_usd,
+            "enabled": r.enabled,
+            "last_used_at": _iso(r.last_used_at),
+            "last_error": r.last_error,
+            "created_at": _iso(r.created_at),
+        }
+
+    def _pricing_view(r: PricingRule) -> dict:
+        return {
+            "model": r.model,
+            "input_usd_per_1m": r.input_usd_per_1m,
+            "output_usd_per_1m": r.output_usd_per_1m,
+            "cached_input_usd_per_1m": r.cached_input_usd_per_1m,
+            "reasoning_usd_per_1m": r.reasoning_usd_per_1m,
+            "updated_at": _iso(r.updated_at),
+        }
+
+    def _settings_payload(db: Session) -> dict:
+        daily, monthly = _effective_budgets(db)
+        rules = db.query(PricingRule).order_by(PricingRule.model).all()
+        return {
+            "budgets": {
+                "global_daily_usd": daily,
+                "global_monthly_usd": monthly,
+            },
+            "pricing_rules": [_pricing_view(r) for r in rules],
+            "retention_days": _effective_retention_days(db),
+            "version": _version_payload(),
+        }
+
+    def _percentile(sorted_vals: list[int], pct: float) -> int | None:
+        if not sorted_vals:
+            return None
+        idx = max(0, math.ceil(pct / 100.0 * len(sorted_vals)) - 1)
+        return sorted_vals[idx]
+
+    def _is_number(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _is_int(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    # ---- admin auth ----
+    @app.post("/api/v1/admin/login")
+    async def admin_login(request: Request, db: Session = Depends(get_db)):
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        username = payload.get("username")
+        password = payload.get("password")
+        if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
+            return gateway_error(400, "invalid_request", "username and password are required")
+        if db.query(AdminAccount).count() == 0:
+            # No admin account seeded (ADMIN_PASSWORD was absent at startup).
+            return gateway_error(503, "admin_not_configured", "admin login is not configured on this server")
+        key = _login_key(request, username)
+        if _login_blocked(key):
+            return gateway_error(429, "rate_limited", "too many failed login attempts; try again later")
+        account = db.query(AdminAccount).filter(AdminAccount.username == username).first()
+        if account is None or not verify_admin_password(password, account.password_hash):
+            _record_login_failure(key)
+            # Generic message: never reveal whether the username exists.
+            return gateway_error(401, "invalid_admin_credentials", "invalid username or password")
+        _clear_login_failures(key)
+        raw_token = generate_session_token()
+        csrf_token = generate_csrf_token()
+        now = _now_aware()
+        db.add(AdminSession(
+            account_id=account.id,
+            session_token_hash=hash_session_token(raw_token),
+            csrf_token=csrf_token,
+            expires_at=now + timedelta(hours=settings.admin_session_hours),
+            created_at=now,
+            last_seen_at=now,
+        ))
+        db.commit()
+        audit("admin_login", f"username={account.username}")
+        resp = JSONResponse(content={"ok": True, "username": account.username})
+        _set_session_cookie(resp, raw_token)
+        _set_csrf_cookie(resp, csrf_token)
+        return resp
+
+    @app.post("/api/v1/admin/logout")
+    def admin_logout(request: Request, db: Session = Depends(get_db)):
+        account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        db.delete(session_row)
+        db.commit()
+        audit("admin_logout", f"username={account.username}")
+        resp = JSONResponse(content={"ok": True})
+        resp.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+        resp.delete_cookie(ADMIN_CSRF_COOKIE, path="/")
+        return resp
+
+    @app.get("/api/v1/admin/me")
+    def admin_me(request: Request, db: Session = Depends(get_db)):
+        account, _session_row = require_admin_session(request, db)
+        return {"authenticated": True, "username": account.username}
+
+    @app.get("/api/v1/admin/csrf")
+    def admin_csrf(request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        remaining = int((_as_aware(session_row.expires_at) - _now_aware()).total_seconds())
+        resp = JSONResponse(content={"csrf_token": session_row.csrf_token})
+        _set_csrf_cookie(resp, session_row.csrf_token, max_age=max(0, remaining))
+        return resp
+
+    # ---- admin models ----
+    @app.get("/api/v1/admin/models")
+    async def admin_v1_list_models(request: Request, db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        rows = db.query(ModelRegistry).order_by(ModelRegistry.sort_order).all()
+        registry_names = {r.canonical_name for r in rows}
+        upstream_names: set[str] = set()
+        upstream_reachable = False
+        try:
+            upstream_client = build_upstream_client(settings, app.state.transport)
+            try:
+                req = upstream_client.build_request("GET", "/models")
+                resp = await _send_with_timeout(
+                    upstream_client, req, False, settings.upstream_timeout_s
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("data") if isinstance(data, dict) else None
+                    if isinstance(items, list):
+                        upstream_names = {
+                            str(item.get("id")) for item in items
+                            if isinstance(item, dict) and item.get("id")
+                        }
+                        upstream_reachable = True
+                await resp.aread()
+            finally:
+                await upstream_client.aclose()
+        except Exception:
+            logger.warning("admin model list: live upstream /v1/models fetch failed")
+        models = []
+        for r in rows:
+            view = _model_view(r)
+            view["in_upstream"] = r.canonical_name in upstream_names
+            models.append(view)
+        upstream_only = [
+            {"id": name} for name in sorted(upstream_names - registry_names)
+        ]
+        return {"models": models, "upstream_only": upstream_only,
+                "upstream_reachable": upstream_reachable}
+
+    @app.patch("/api/v1/admin/models/{canonical}")
+    async def admin_v1_patch_model(canonical: str, request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        row = db.query(ModelRegistry).filter(ModelRegistry.canonical_name == canonical).first()
+        if row is None:
+            return gateway_error(404, "model_not_found", f"unknown model: {canonical}")
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        bool_fields = ("enabled", "is_default", "cap_responses", "cap_chat",
+                       "cap_streaming", "cap_tools", "cap_image")
+        changed: list[str] = []
+        for field in bool_fields:
+            if field in payload:
+                if not isinstance(payload[field], bool):
+                    return gateway_error(400, "invalid_request", f"field '{field}' must be a boolean")
+                setattr(row, field, payload[field])
+                changed.append(field)
+        if "aliases" in payload:
+            if not isinstance(payload["aliases"], list) or not all(isinstance(a, str) for a in payload["aliases"]):
+                return gateway_error(400, "invalid_request", "field 'aliases' must be a list of strings")
+            row.aliases = payload["aliases"]
+            changed.append("aliases")
+        if "sort_order" in payload:
+            if not _is_int(payload["sort_order"]):
+                return gateway_error(400, "invalid_request", "field 'sort_order' must be an integer")
+            row.sort_order = payload["sort_order"]
+            changed.append("sort_order")
+        if "pinned_group" in payload:
+            if payload["pinned_group"] is not None and not isinstance(payload["pinned_group"], str):
+                return gateway_error(400, "invalid_request", "field 'pinned_group' must be a string or null")
+            row.pinned_group = payload["pinned_group"]
+            changed.append("pinned_group")
+        if row.is_default:
+            # Exactly one default: setting one clears the others.
+            db.query(ModelRegistry).filter(
+                ModelRegistry.id != row.id, ModelRegistry.is_default.is_(True)
+            ).update({"is_default": False})
+        db.commit()
+        db.refresh(row)
+        audit("model_updated", f"model={canonical} fields={','.join(changed) or 'none'}")
+        return _model_view(row)
+
+    @app.post("/api/v1/admin/models/{canonical}/verify")
+    async def admin_v1_verify_model(canonical: str, request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        mode = (payload or {}).get("mode", "real")
+        err, row, status, method = await _verify_model(canonical, db, mode)
+        if err is not None:
+            return err
+        return {
+            "model": _model_view(row),
+            "verification_http_status": status,
+            "verification_method": method,
+            "cost_warning": "this sends a real request and may incur API cost",
+            "note": "Mock verification is NOT real verification." if method == "mock-test-only" else None,
+        }
+
+    # ---- admin client keys ----
+    @app.get("/api/v1/admin/client-keys")
+    def admin_v1_list_client_keys(request: Request, db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        rows = db.query(ClientKey).order_by(ClientKey.id).all()
+        return {"client_keys": [_client_key_view(r) for r in rows]}
+
+    @app.post("/api/v1/admin/client-keys")
+    async def admin_v1_create_client_key(request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        name = payload.get("name", "client")
+        if not isinstance(name, str) or not name:
+            return gateway_error(400, "invalid_request", "field 'name' must be a non-empty string")
+        client_type = payload.get("client_type")
+        if client_type is not None and client_type not in VALID_CLIENT_TYPES:
+            return gateway_error(400, "invalid_request",
+                                 "field 'client_type' must be one of web, codex, vscode, other")
+        allowed = payload.get("allowed_models", ["*"])
+        if not isinstance(allowed, list) or not all(isinstance(m, str) for m in allowed):
+            return gateway_error(400, "invalid_request", "field 'allowed_models' must be a list of strings")
+        rate = payload.get("rate_limit_per_min", settings.default_rate_limit_per_min)
+        concurrency = payload.get("concurrency_limit", settings.default_concurrency_limit)
+        budget = payload.get("monthly_budget_usd", settings.budget_client_monthly_usd)
+        if not _is_int(rate) or rate < 0:
+            return gateway_error(400, "invalid_request", "field 'rate_limit_per_min' must be a non-negative integer")
+        if not _is_int(concurrency) or concurrency < 0:
+            return gateway_error(400, "invalid_request", "field 'concurrency_limit' must be a non-negative integer")
+        if not _is_number(budget) or budget < 0:
+            return gateway_error(400, "invalid_request", "field 'monthly_budget_usd' must be a non-negative number")
+        raw = generate_client_key()
+        row = ClientKey(
+            name=name,
+            key_hash=hash_client_key(raw),
+            key_prefix=raw[:12],
+            client_type=client_type,
+            allowed_models=allowed,
+            rate_limit_per_min=rate,
+            concurrency_limit=concurrency,
+            monthly_budget_usd=float(budget),
+            enabled=True,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        audit("client_key_created", f"client_key_id={row.id} name={row.name} type={client_type}")
+        view = _client_key_view(row)
+        view["raw_key"] = raw
+        view["warning"] = "Store this key now — it will never be shown again."
+        return view
+
+    @app.patch("/api/v1/admin/client-keys/{key_id}")
+    async def admin_v1_patch_client_key(key_id: int, request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        row = db.query(ClientKey).filter(ClientKey.id == key_id).first()
+        if row is None:
+            return gateway_error(404, "client_key_not_found", f"unknown client key: {key_id}")
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        changed: list[str] = []
+        if "name" in payload:
+            if not isinstance(payload["name"], str) or not payload["name"]:
+                return gateway_error(400, "invalid_request", "field 'name' must be a non-empty string")
+            row.name = payload["name"]
+            changed.append("name")
+        if "client_type" in payload:
+            if payload["client_type"] is not None and payload["client_type"] not in VALID_CLIENT_TYPES:
+                return gateway_error(400, "invalid_request",
+                                     "field 'client_type' must be one of web, codex, vscode, other")
+            row.client_type = payload["client_type"]
+            changed.append("client_type")
+        if "allowed_models" in payload:
+            if not isinstance(payload["allowed_models"], list) or not all(isinstance(m, str) for m in payload["allowed_models"]):
+                return gateway_error(400, "invalid_request", "field 'allowed_models' must be a list of strings")
+            row.allowed_models = payload["allowed_models"]
+            changed.append("allowed_models")
+        if "rate_limit_per_min" in payload:
+            if not _is_int(payload["rate_limit_per_min"]) or payload["rate_limit_per_min"] < 0:
+                return gateway_error(400, "invalid_request", "field 'rate_limit_per_min' must be a non-negative integer")
+            row.rate_limit_per_min = payload["rate_limit_per_min"]
+            changed.append("rate_limit_per_min")
+        if "concurrency_limit" in payload:
+            if not _is_int(payload["concurrency_limit"]) or payload["concurrency_limit"] < 0:
+                return gateway_error(400, "invalid_request", "field 'concurrency_limit' must be a non-negative integer")
+            row.concurrency_limit = payload["concurrency_limit"]
+            changed.append("concurrency_limit")
+        if "monthly_budget_usd" in payload:
+            if not _is_number(payload["monthly_budget_usd"]) or payload["monthly_budget_usd"] < 0:
+                return gateway_error(400, "invalid_request", "field 'monthly_budget_usd' must be a non-negative number")
+            row.monthly_budget_usd = float(payload["monthly_budget_usd"])
+            changed.append("monthly_budget_usd")
+        if "enabled" in payload:
+            if not isinstance(payload["enabled"], bool):
+                return gateway_error(400, "invalid_request", "field 'enabled' must be a boolean")
+            row.enabled = payload["enabled"]
+            changed.append("enabled")
+        db.commit()
+        db.refresh(row)
+        audit("client_key_updated", f"client_key_id={key_id} fields={','.join(changed) or 'none'}")
+        return _client_key_view(row)
+
+    @app.post("/api/v1/admin/client-keys/{key_id}/revoke")
+    def admin_v1_revoke_client_key(key_id: int, request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        row = db.query(ClientKey).filter(ClientKey.id == key_id).first()
+        if row is None:
+            return gateway_error(404, "client_key_not_found", f"unknown client key: {key_id}")
+        row.enabled = False
+        db.commit()
+        db.refresh(row)
+        audit("client_key_revoked", f"client_key_id={key_id} name={row.name}")
+        return _client_key_view(row)
+
+    @app.post("/api/v1/admin/client-keys/{key_id}/regenerate")
+    def admin_v1_regenerate_client_key(key_id: int, request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        row = db.query(ClientKey).filter(ClientKey.id == key_id).first()
+        if row is None:
+            return gateway_error(404, "client_key_not_found", f"unknown client key: {key_id}")
+        raw = generate_client_key()
+        row.key_hash = hash_client_key(raw)
+        row.key_prefix = raw[:12]
+        db.commit()
+        db.refresh(row)
+        audit("client_key_regenerated", f"client_key_id={key_id} name={row.name}")
+        view = _client_key_view(row)
+        view["raw_key"] = raw
+        view["warning"] = "Store this key now — it will never be shown again."
+        return view
+
+    # ---- admin usage ----
+    @app.get("/api/v1/admin/usage")
+    def admin_v1_usage(request: Request, period: str = "today", db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        if period not in ("today", "yesterday", "month"):
+            return gateway_error(400, "invalid_request", "period must be 'today', 'yesterday' or 'month'")
+        now = _now_aware()
+        if period == "today":
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = now
+        elif period == "yesterday":
+            start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = now
+        logs = (
+            db.query(ApiRequestLog)
+            .filter(ApiRequestLog.created_at >= start, ApiRequestLog.created_at < end)
+            .all()
+        )
+        usage_rows = (
+            db.query(UsageRecord)
+            .filter(UsageRecord.created_at >= start, UsageRecord.created_at < end)
+            .all()
+        )
+        total = len(logs)
+        success = sum(1 for l in logs if l.status_code is not None and 200 <= l.status_code < 300)
+        errors = sum(1 for l in logs if l.status_code is not None and l.status_code >= 400)
+        latencies = sorted(l.latency_ms for l in logs if l.latency_ms is not None)
+        tokens_in = sum(r.tokens_in or 0 for r in usage_rows)
+        tokens_out = sum(r.tokens_out or 0 for r in usage_rows)
+        tokens_cached = sum(r.tokens_cached or 0 for r in usage_rows)
+        tokens_reasoning = sum(r.tokens_reasoning or 0 for r in usage_rows)
+        cost_exact = sum(r.cost_usd or 0.0 for r in usage_rows if r.cost_status == "exact")
+        cost_breakdown = {"exact": 0, "not_obtained": 0, "price_not_configured": 0}
+        for r in usage_rows:
+            if r.cost_status in cost_breakdown:
+                cost_breakdown[r.cost_status] += 1
+            else:
+                cost_breakdown[r.cost_status] = cost_breakdown.get(r.cost_status, 0) + 1
+        # Per-model ranking (requests from logs, tokens/cost from usage).
+        by_model: dict[str, dict] = {}
+        for l in logs:
+            name = l.model or "unknown"
+            entry = by_model.setdefault(name, {"model": name, "requests": 0, "success_count": 0,
+                                               "error_count": 0, "tokens_in": 0, "tokens_out": 0,
+                                               "cost_usd": 0.0})
+            entry["requests"] += 1
+            if l.status_code is not None and 200 <= l.status_code < 300:
+                entry["success_count"] += 1
+            if l.status_code is not None and l.status_code >= 400:
+                entry["error_count"] += 1
+        for r in usage_rows:
+            entry = by_model.setdefault(r.model or "unknown", {"model": r.model or "unknown", "requests": 0,
+                                                               "success_count": 0, "error_count": 0,
+                                                               "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
+            entry["tokens_in"] += r.tokens_in or 0
+            entry["tokens_out"] += r.tokens_out or 0
+            if r.cost_status == "exact":
+                entry["cost_usd"] += r.cost_usd or 0.0
+        for entry in by_model.values():
+            entry["cost_usd"] = round(entry["cost_usd"], 6)
+        # Per-client ranking, by client name — never raw key material.
+        key_names = {k.id: k.name for k in db.query(ClientKey).all()}
+        by_client: dict[str, dict] = {}
+        for l in logs:
+            name = key_names.get(l.client_key_id, "unknown") if l.client_key_id is not None else "unknown"
+            entry = by_client.setdefault(name, {"client": name, "requests": 0, "success_count": 0,
+                                                "error_count": 0, "tokens_in": 0, "tokens_out": 0,
+                                                "cost_usd": 0.0})
+            entry["requests"] += 1
+            if l.status_code is not None and 200 <= l.status_code < 300:
+                entry["success_count"] += 1
+            if l.status_code is not None and l.status_code >= 400:
+                entry["error_count"] += 1
+        for r in usage_rows:
+            name = key_names.get(r.client_key_id, "unknown") if r.client_key_id is not None else "unknown"
+            entry = by_client.setdefault(name, {"client": name, "requests": 0, "success_count": 0,
+                                                "error_count": 0, "tokens_in": 0, "tokens_out": 0,
+                                                "cost_usd": 0.0})
+            entry["tokens_in"] += r.tokens_in or 0
+            entry["tokens_out"] += r.tokens_out or 0
+            if r.cost_status == "exact":
+                entry["cost_usd"] += r.cost_usd or 0.0
+        for entry in by_client.values():
+            entry["cost_usd"] = round(entry["cost_usd"], 6)
+        # Daily trend: one bucket per day in the period.
+        first_day = start.date()
+        last_day = (end - timedelta(seconds=1)).date()
+        trend: dict = {}
+        day = first_day
+        while day <= last_day:
+            trend[day] = {"date": day.isoformat(), "requests": 0,
+                          "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+            day += timedelta(days=1)
+        for l in logs:
+            bucket = trend.get(_as_aware(l.created_at).date())
+            if bucket is not None:
+                bucket["requests"] += 1
+        for r in usage_rows:
+            bucket = trend.get(_as_aware(r.created_at).date())
+            if bucket is not None:
+                bucket["tokens_in"] += r.tokens_in or 0
+                bucket["tokens_out"] += r.tokens_out or 0
+                if r.cost_status == "exact":
+                    bucket["cost_usd"] += r.cost_usd or 0.0
+        for bucket in trend.values():
+            bucket["cost_usd"] = round(bucket["cost_usd"], 6)
+        # Error distribution by error_type / status.
+        err_groups: dict[tuple[str | None, int | None], int] = {}
+        for l in logs:
+            if l.status_code is not None and l.status_code >= 400:
+                key = (l.error_type, l.status_code)
+                err_groups[key] = err_groups.get(key, 0) + 1
+        error_dist = [
+            {"error_type": et, "status_code": sc, "count": n}
+            for (et, sc), n in sorted(err_groups.items(), key=lambda kv: -kv[1])
+        ]
+        daily_limit, monthly_limit = _effective_budgets(db)
+        spent_today = budget_mod.spend_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
+        spent_month = budget_mod.spend_since(db, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+        alerts: list[str] = []
+        if spent_today >= daily_limit:
+            alerts.append("global_daily_budget_exceeded")
+        if spent_month >= monthly_limit:
+            alerts.append("global_monthly_budget_exceeded")
+        return {
+            "period": period,
+            "requests": total,
+            "success_count": success,
+            "error_count": errors,
+            "success_rate": round(success / total, 4) if total else None,
+            "error_rate": round(errors / total, 4) if total else None,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
+            "p95_latency_ms": _percentile(latencies, 95),
+            "tokens": {
+                "in": tokens_in, "out": tokens_out,
+                "total": tokens_in + tokens_out,
+                "cached": tokens_cached, "reasoning": tokens_reasoning,
+            },
+            "cost_usd": round(cost_exact, 6),
+            "cost_status": cost_breakdown,
+            "per_model": sorted(by_model.values(), key=lambda e: (-e["requests"], e["model"])),
+            "per_client": sorted(by_client.values(), key=lambda e: (-e["requests"], e["client"])),
+            "daily_trend": [trend[d] for d in sorted(trend)],
+            "errors": error_dist,
+            "budget": {
+                "global_daily_usd": daily_limit,
+                "global_monthly_usd": monthly_limit,
+                "spent_today": round(spent_today, 6),
+                "spent_month": round(spent_month, 6),
+                "alerts": alerts,
+            },
+        }
+
+    # ---- admin request traces ----
+    def _log_view(l: ApiRequestLog, db: Session) -> dict:
+        name = "unknown"
+        if l.client_key_id is not None:
+            key = db.query(ClientKey).filter(ClientKey.id == l.client_key_id).first()
+            name = key.name if key is not None else "unknown"
+        return {
+            "id": l.id,
+            "trace_id": l.trace_id,
+            "client": name,
+            "client_key_id": l.client_key_id,
+            "model": l.model,
+            "endpoint": l.endpoint,
+            "status_code": l.status_code,
+            "latency_ms": l.latency_ms,
+            "tokens_in": l.tokens_in,
+            "tokens_out": l.tokens_out,
+            "tokens_cached": l.tokens_cached,
+            "tokens_reasoning": l.tokens_reasoning,
+            "error_type": l.error_type,
+            "created_at": _iso(l.created_at),
+        }
+
+    @app.get("/api/v1/admin/requests")
+    def admin_v1_list_requests(request: Request, limit: str = "50", error_only: str = "false",
+                               db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        try:
+            limit_n = int(limit)
+        except ValueError:
+            return gateway_error(400, "invalid_request", "limit must be an integer")
+        limit_n = max(1, min(200, limit_n))
+        only_errors = error_only.lower() in ("1", "true", "yes")
+        q = db.query(ApiRequestLog)
+        if only_errors:
+            q = q.filter(
+                (ApiRequestLog.status_code >= 400) | (ApiRequestLog.error_type.isnot(None))
+            )
+        rows = q.order_by(ApiRequestLog.created_at.desc(), ApiRequestLog.id.desc()).limit(limit_n).all()
+        return {"requests": [_log_view(r, db) for r in rows]}
+
+    @app.get("/api/v1/admin/requests/{trace_id}")
+    def admin_v1_get_request(trace_id: str, request: Request, db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        row = (
+            db.query(ApiRequestLog)
+            .filter(ApiRequestLog.trace_id == trace_id)
+            .order_by(ApiRequestLog.created_at.asc(), ApiRequestLog.id.asc())
+            .first()
+        )
+        if row is None:
+            return gateway_error(404, "trace_not_found", f"unknown trace id: {trace_id}")
+        view = _log_view(row, db)
+        view["upstream_request_id"] = row.upstream_request_id
+        usage = (
+            db.query(UsageRecord)
+            .filter(UsageRecord.trace_id == trace_id)
+            .first()
+        )
+        view["usage"] = None
+        if usage is not None:
+            view["usage"] = {
+                "trace_id": usage.trace_id,
+                "model": usage.model,
+                "tokens_in": usage.tokens_in,
+                "tokens_out": usage.tokens_out,
+                "tokens_cached": usage.tokens_cached,
+                "tokens_reasoning": usage.tokens_reasoning,
+                "cost_usd": usage.cost_usd,
+                "cost_status": usage.cost_status,
+                "created_at": _iso(usage.created_at),
+            }
+        return view
+
+    # ---- admin settings ----
+    @app.get("/api/v1/admin/settings")
+    def admin_v1_get_settings(request: Request, db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        return _settings_payload(db)
+
+    @app.put("/api/v1/admin/settings")
+    async def admin_v1_put_settings(request: Request, db: Session = Depends(get_db)):
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        changed: list[str] = []
+        budgets = payload.get("budgets")
+        if budgets is not None:
+            if not isinstance(budgets, dict):
+                return gateway_error(400, "invalid_request", "field 'budgets' must be an object")
+            for field, key in (("global_daily_usd", "budget_global_daily_usd"),
+                               ("global_monthly_usd", "budget_global_monthly_usd")):
+                if field in budgets:
+                    if not _is_number(budgets[field]) or budgets[field] < 0:
+                        return gateway_error(400, "invalid_request",
+                                             f"budgets.{field} must be a non-negative number")
+                    _set_setting(db, key, float(budgets[field]))
+                    changed.append(key)
+        # Top-level budget fields are also accepted for convenience.
+        for field, key in (("global_daily_usd", "budget_global_daily_usd"),
+                           ("global_monthly_usd", "budget_global_monthly_usd")):
+            if field in payload:
+                if not _is_number(payload[field]) or payload[field] < 0:
+                    return gateway_error(400, "invalid_request",
+                                         f"field '{field}' must be a non-negative number")
+                _set_setting(db, key, float(payload[field]))
+                changed.append(key)
+        if "retention_days" in payload:
+            if not _is_int(payload["retention_days"]) or payload["retention_days"] < 1:
+                return gateway_error(400, "invalid_request", "field 'retention_days' must be an integer >= 1")
+            _set_setting(db, "retention_days", payload["retention_days"])
+            changed.append("retention_days")
+        rules = payload.get("pricing_rules")
+        if rules is not None:
+            if not isinstance(rules, list):
+                return gateway_error(400, "invalid_request", "field 'pricing_rules' must be a list")
+            for entry in rules:
+                if not isinstance(entry, dict) or not entry.get("model") or not isinstance(entry["model"], str):
+                    return gateway_error(400, "invalid_request", "each pricing rule needs a 'model' string")
+                for rate_field in ("input_usd_per_1m", "output_usd_per_1m"):
+                    if rate_field not in entry or not _is_number(entry[rate_field]) or entry[rate_field] < 0:
+                        return gateway_error(400, "invalid_request",
+                                             f"pricing rule '{entry['model']}' needs non-negative '{rate_field}'")
+                for opt_field in ("cached_input_usd_per_1m", "reasoning_usd_per_1m"):
+                    if entry.get(opt_field) is not None and (not _is_number(entry[opt_field]) or entry[opt_field] < 0):
+                        return gateway_error(400, "invalid_request",
+                                             f"pricing rule '{entry['model']}' field '{opt_field}' must be a non-negative number or null")
+                existing = db.query(PricingRule).filter(PricingRule.model == entry["model"]).first()
+                if existing is None:
+                    db.add(PricingRule(
+                        model=entry["model"],
+                        input_usd_per_1m=float(entry["input_usd_per_1m"]),
+                        output_usd_per_1m=float(entry["output_usd_per_1m"]),
+                        cached_input_usd_per_1m=entry.get("cached_input_usd_per_1m"),
+                        reasoning_usd_per_1m=entry.get("reasoning_usd_per_1m"),
+                    ))
+                else:
+                    existing.input_usd_per_1m = float(entry["input_usd_per_1m"])
+                    existing.output_usd_per_1m = float(entry["output_usd_per_1m"])
+                    existing.cached_input_usd_per_1m = entry.get("cached_input_usd_per_1m")
+                    existing.reasoning_usd_per_1m = entry.get("reasoning_usd_per_1m")
+                changed.append(f"pricing:{entry['model']}")
+        db.commit()
+        audit("settings_updated", f"fields={','.join(changed) or 'none'}")
+        return _settings_payload(db)
+
+    # ---- admin audit log ----
+    @app.get("/api/v1/admin/audit")
+    def admin_v1_audit(request: Request, limit: str = "50", db: Session = Depends(get_db)):
+        require_admin_session(request, db)
+        try:
+            limit_n = int(limit)
+        except ValueError:
+            return gateway_error(400, "invalid_request", "limit must be an integer")
+        limit_n = max(1, min(200, limit_n))
+        rows = (
+            db.query(AuditEvent)
+            .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+            .limit(limit_n)
+            .all()
+        )
+        return {"audit": [
+            {"id": r.id, "kind": r.kind, "detail": r.detail, "created_at": _iso(r.created_at)}
+            for r in rows
+        ]}
 
     return app
 
@@ -904,6 +1767,13 @@ def _model_view(r: ModelRegistry) -> dict:
 
 
 class _Unauthorized(Exception):
+    def __init__(self, message: str):
+        self.message = message
+
+
+class _AdminUnauthorized(Exception):
+    """Admin console session auth failure (cookie session, Stage E)."""
+
     def __init__(self, message: str):
         self.message = message
 

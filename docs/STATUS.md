@@ -206,6 +206,83 @@ sudo 或 docker 组成员身份），部署前先备份。
   （mock 报告 `configured: false`）；全部验证均为 Mock 上游，
   真实模型验证与真实 Codex 测试继续阻塞。
 
+### E — 管理后台（2026-11-14 08:15–08:35 CST，本地分支 `feature/admin-backend`）
+
+- 提交：`86cb447`（Stage E 1/3：后端——Argon2id 会话鉴权、
+  `/api/v1/admin/*`、迁移 0003、35 个新测试）、`9bcf374`（Stage E 2/3：
+  前端——管理控制台 7 个页面 + admin 客户端库 + 14 个新测试，含联调
+  归一化修复 + 6 个归一化回归测试）、本文档提交（Stage E 3/3）。
+  协调员独立复核后提交；本地分支 `feature/admin-backend`，从 Stage D
+  `daa055b` 建出；按分支模型走 feature → develop 快照推送。
+- 后端（`apps/api`，FastAPI）：新增 `AdminAccount` / `AdminSession` /
+  `SystemSetting` 表 + `ClientKey.client_type` / `key_prefix`，Alembic
+  迁移 `0003_admin_auth`（`0001 → 0002 → 0003` 全新 SQLite 库升级验证通过，
+  降级到 0002 再升级回 head 亦验证通过；PostgreSQL 兼容性按可移植类型
+  构造，未在 PG 上实跑）。单管理员账号：启动时从 `ADMIN_USERNAME` +
+  `ADMIN_PASSWORD` 种子一次（Argon2id 哈希，仅表空时；无密码则登录
+  503）。`POST /api/v1/admin/login` 设 HttpOnly SameSite=Lax `pag_admin`
+  会话 Cookie（12h，`SESSION_COOKIE_SECURE=true` 时 Secure）；失败 5 次 /
+  15 分钟 /（IP + 用户名）→ 429；`POST /logout`、`GET /me`、
+  `GET /csrf`（双提交：`X-CSRF-Token` 须与会话 token 及 `pag_csrf`
+  Cookie 一致，变更加操作缺失即 403；登录是唯一免 CSRF 的变更操作）。
+  新规范管理 API `/api/v1/admin/*`：模型中心（列表含 `in_upstream` /
+  `upstream_only` / `upstream_reachable`、PATCH、verify 含 cost_warning，
+  mock 记 `mock-test-only` 永不记 `real`）、密钥中心（列表不含原始密钥、
+  创建/重新生成仅返回一次 `raw_key`、撤销保留行 + 审计）、用量仪表盘
+  （today/yesterday/month 聚合：请求/成功率/错误率/平均 + P95 延迟/
+  token / 成本 + `exact/not_obtained/price_not_configured` 明细、模型与
+  客户端排行、日趋势、错误分布、预算状态 + 告警）、请求诊断（trace
+  查询 + 最近请求列表）、设置（全局预算/定价规则/保留天数/版本信息，
+  存 `system_settings`）、审计列表。旧 bearer `/admin/*` 端点行为未变
+  （verify 逻辑抽为共享 `_verify_model`，行为一致）。
+- 前端（`apps/web`，Next.js）：`/admin/login`（401/429/503 映射）、
+  `/admin` 总览、`/admin/models`（固定版本分组、状态徽章、启用/默认/
+  别名/排序/能力编辑、验证前两步确认并显示费用警告）、`/admin/keys`
+  （创建/撤销/重新生成、密钥仅显示一次、连接指南含 base URL + 环境变量
+  + Codex 配置）、`/admin/usage`（时段切换、统计卡片、排行、日趋势、
+  错误分布、预算告警；成本状态标签：非 exact 一律标为不完整合计）、
+  `/admin/diagnostics`（trace 查询 + 最近请求/仅错误过滤）、
+  `/admin/settings`（全局预算、定价规则编辑、保留策略、版本信息）。
+  共享 `src/lib/admin.ts`（会话 Cookie `credentials: include`、CSRF
+  自动获取、登录错误映射、成本标签、verified 判定仅
+  `available + real`）。
+- 协调员联调修复（本阶段关键发现）：后端与前端的响应信封形状不一致，
+  前端原样直传会导致管理页空白/崩溃：模型行能力是嵌套 `capabilities`
+  而非平铺 `cap_*`；`upstream_only` 是 `[{id}]` 对象而非字符串数组；
+  verify 返回 `{model, cost_warning, ...}` 包裹而非模型本身；
+  密钥列表是 `{client_keys: [...]}` 而非 `keys`；用量是嵌套 `tokens` /
+  `per_model` / `per_client` / `errors` / `budget` 与 `cost_status`
+  明细对象而非平铺字段；设置是 `pricing_rules` 与
+  `global_daily_usd/global_monthly_usd` 而非 `pricing` /
+  `daily_usd/monthly_usd`；请求行是 `client` / `error_type` 而非
+  `client_name` / `error`。修复在 `src/lib/admin.ts` 集中做归一化
+  （`normalizeAdminModel` / `normalizeUsageStats` /
+  `normalizeAdminSettings` / `toBackendSettings` /
+  `normalizeAdminRequest`），后端 API 与测试未动；新增 6 个归一化
+  回归测试（用真实后端形状的 fixture）。随后用真实网关 + Mock 上游
+  做端到端冒烟：登录 200、CSRF 200、建密钥 200（无 CSRF 时 403）、
+  mock 验证 200、`/v1/chat/completions` 200（tokens 12/7）、用量聚合
+  requests 1 且 `cost_status` 明细为 `price_not_configured: 1`（归一化
+  后标签为“价格未配置”，不显示为精确合计）、trace 可查、登出后
+  `/me` 401。
+- 本阶段独立验证（协调员重跑，全部通过，命令与退出码）：
+  - `./.venv/bin/pytest tests/ -q` → **71 passed（36 旧 + 35 新），
+    1 warning（既有 Starlette 弃用警告），exit 0**
+  - `cd apps/web && npm test` → **65 passed（10 文件；45 旧 + 14 新 +
+    6 归一化回归），exit 0**
+  - `cd apps/web && npm run typecheck` → **exit 0**
+  - `cd apps/web && npm run lint` → **exit 0**
+  - `cd apps/web && npm run build` → **exit 0**（7 个 admin 路由均
+    预渲染；`/` 与 `/chat` 未动仍可构建）
+  - Alembic 全新库 `upgrade head` → `0001 → 0002 → 0003_admin_auth`，
+    12 张表齐全；降级 + 再升级验证通过。
+- 已知缺口（记入，不谎称完成）：`PUT /settings` 持久化的全局预算
+  目前只在用量/设置接口中上报，`/v1/*` 请求时预算强制仍读环境变量
+  默认值（按“不改既有端点行为”规则未接线），接线是后续工作；
+  迁移的 PostgreSQL 实跑未验证（仅可移植类型构造）；真实浏览器内
+  操作管理后台未验证（云端浏览器连不到本机 localhost，推迟到部署后，
+  与网页聊天同一口径）。
+
 ## 明确阻塞项（不得绕过、不得伪造）
 
 1. **真实 OpenAI API 密钥没有。** 严禁复用其他对话/截图里出现过的

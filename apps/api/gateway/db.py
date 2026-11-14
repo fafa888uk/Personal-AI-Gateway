@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings
-from .models import Base, ModelRegistry
+from .models import AdminAccount, Base, ModelRegistry
 
 
 def make_engine(settings: Settings):
@@ -40,8 +40,31 @@ def init_db(settings: Settings) -> sessionmaker[Session]:
     Base.metadata.create_all(engine)
     with factory() as session:
         seed_registry(session, settings.candidate_models)
+        seed_admin(session, settings)
         session.commit()
     return factory
+
+
+def seed_admin(session: Session, settings: Settings) -> AdminAccount | None:
+    """Seed the single admin console account from env, once.
+
+    Only if the admin_accounts table is empty AND ADMIN_PASSWORD is set.
+    The password is hashed with Argon2id; plaintext is never stored or
+    logged. An existing account is never overwritten or re-hashed.
+    """
+    from .auth import hash_admin_password
+
+    existing = session.query(AdminAccount).first()
+    if existing is not None:
+        return None
+    if not settings.admin_password:
+        return None
+    row = AdminAccount(
+        username=settings.admin_username or "admin",
+        password_hash=hash_admin_password(settings.admin_password),
+    )
+    session.add(row)
+    return row
 
 
 def seed_registry(session: Session, candidates: list[str]) -> list[ModelRegistry]:
