@@ -168,6 +168,7 @@ jobs:
       VERSION: ${{ needs.resolve-version.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: personal-ai-${{ needs.resolve-version.outputs.version }}-macos-dmg-build-only
