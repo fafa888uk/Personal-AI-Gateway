@@ -1045,13 +1045,38 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
             row.value = value
 
     def _effective_budgets(db: Session) -> tuple[float, float]:
-        return (
-            float(_get_setting(db, "budget_global_daily_usd", settings.budget_global_daily_usd)),
-            float(_get_setting(db, "budget_global_monthly_usd", settings.budget_global_monthly_usd)),
-        )
+        """Effective budgets for the admin API: persisted SystemSetting
+        wins, env Settings are the default/fallback.
+
+        Mirrors budgets.resolve_global_budgets: a stored value that is
+        not a number or is negative is ignored and the env default is
+        used. A bad row must never crash the admin API — before this
+        fix an unguarded float() here turned GET /api/v1/admin/settings
+        (and /usage, and backup creation) into a 500 while the /v1/*
+        enforcement path already fell back correctly.
+        """
+        daily = settings.budget_global_daily_usd
+        monthly = settings.budget_global_monthly_usd
+        for key in ("budget_global_daily_usd", "budget_global_monthly_usd"):
+            default = daily if key == "budget_global_daily_usd" else monthly
+            try:
+                value = float(_get_setting(db, key, default))
+            except (TypeError, ValueError):
+                continue
+            if value < 0:
+                continue
+            if key == "budget_global_daily_usd":
+                daily = value
+            else:
+                monthly = value
+        return daily, monthly
 
     def _effective_retention_days(db: Session) -> int:
-        return int(_get_setting(db, "retention_days", DEFAULT_RETENTION_DAYS))
+        try:
+            value = int(_get_setting(db, "retention_days", DEFAULT_RETENTION_DAYS))
+        except (TypeError, ValueError):
+            return DEFAULT_RETENTION_DAYS
+        return value if value >= 1 else DEFAULT_RETENTION_DAYS
 
     def _client_key_view(r: ClientKey) -> dict:
         prefix = r.key_prefix or (r.key_hash[:8] if r.key_hash else None)

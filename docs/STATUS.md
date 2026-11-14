@@ -18,7 +18,7 @@
   Stage C/D/E 快照已推 develop（`7a61b545` / `919ad0df` /
   `2c06762`）。同步记录见仓库外
   `personal-ai-gateway.muse-github-snapshot-sync.json`
-  （5 条记录，Stage F 推送后追加第 6 条）。
+  （6 条记录）。
 - 分支说明：Stage B 直接落在本地 main（分支模型建立前的启动例外）；
   从下一阶段起按 feature/* → PR → develop → main 走。
 
@@ -292,8 +292,13 @@ sudo 或 docker 组成员身份），部署前先备份。
 
 ### F — 安全与备份（2026-11-14 08:36–09:00 CST，本地分支 `feature/security-backup`）
 
-- 提交：（待推送后填写）。本地分支 `feature/security-backup`，从
-  Stage E `68ab02a` 建出；按分支模型走 feature → develop 快照推送。
+- 提交：本地 `3e27a7c`；远程 develop 快照
+  `b589ed03d488f854eba5aa45983edc7aa7f72f39`（212 个 UTF-8 文件，已验证
+  为 develop HEAD；37 个二进制文件未进快照——连接器只接受 UTF-8 文本，
+  与此前阶段同一已知缺口，步骤 5 处理）。同步记录见仓库外
+  `personal-ai-gateway.muse-github-snapshot-sync.json`（第 6 条记录）。
+  本地分支 `feature/security-backup`，从 Stage E `68ab02a` 建出；按分
+  支模型走 feature → develop 快照推送。
 - 预算接线（阶段 E 已知缺口已闭合）：`budgets.resolve_global_budgets`
   读 `system_settings` 持久化值，环境变量为默认值/兜底；非法或负值
   行被忽略、仍用环境变量；`check_budgets`（即 `/v1/*` 强制）改用有
@@ -343,6 +348,169 @@ sudo 或 docker 组成员身份），部署前先备份。
   管理后台的备份/改密 UI 未做（只有后端接口）；审计表无自动清理；
   `npm audit` 未能运行（仓库策略 403）；生产服务器上的 PG 备份/
   恢复流程未跑过（只有本机演练），阶段 H 须在服务器上再跑一次。
+
+### G — 集成测试（2026-11-14 09:00–09:15 CST，本地分支 `feature/integration-tests`，从 Stage F `d29cfe7` 建出）
+
+- 任务 A：Flutter 集成测试。`xvfb-run -a scripts/run_integration_test.sh`
+  （mock 网关实测：登录 → 列模型 → 建会话 → 流式发送 → 两端消息经
+  API 核实落库）→ **All tests passed，exit 0**（1 个集成测试，约
+  81 秒；另含 Linux 应用构建成功）。一次通过，无真 bug、无需修
+  客户端代码。全部验证均为 Mock 上游，无真实 OpenAI 密钥。
+- 任务 B：新建 `scripts/e2e_web_smoke.sh`（bash，`set -euo pipefail`，
+  trap 清理，临时密钥文件放 `/tmp`，跑完杀掉所起服务器）。流程：
+  起 `dev_mock_server.py` 网关（Mock 上游）等 `/api/health` 就绪 →
+  `npm run build` → 生产模式 `next start`（端口可用
+  `PAG_MOCK_PORT` / `PAG_WEB_PORT` 覆盖，默认 8000/3001）→ curl
+  检查 `/`、`/chat`、`/manifest.webmanifest`（合法 JSON）、`/sw.js`
+  均为 200 → 按网页客户端真实调用顺序走网关：建会话
+  `POST /api/v1/chats` → 发用户消息 → `POST /v1/chat/completions
+  stream:true` 验 SSE 增量到达且有 `[DONE]` 与 usage 块 → 按网页
+  客户端做法把助手回复连 tokens 一起
+  `POST .../messages` 落库 → `GET .../messages` 确认 2 条且 tokens
+  正确 → `GET /api/v1/usage/summary` 确认请求已计入。全部通过才
+  exit 0，任一步失败 exit 非零并打印哪一步。
+  - 实测：`PAG_MOCK_PORT=8001 PAG_WEB_PORT=3001 scripts/e2e_web_smoke.sh`
+    → **9/9 步通过，exit 0**：`/` 200、`/chat` 200、
+    `/manifest.webmanifest` 200（合法 JSON）、`/sw.js` 200；会话 id 1；
+    SSE 增量 `Hello ` 到达、usage prompt 12 / completion 7、`[DONE]`；
+    落库 2 条消息、助手 `tokens_in=12 tokens_out=7`；用量 today/month
+    均为 requests 1、`cost_status: price_not_configured`（与规则一致，
+    价格未配置故不显示美元数字）。构建产物与阶段 D 一致（`/` 106 kB、
+    `/chat` 208 kB 首屏 JS）。跑完 8001/3001 无监听残留、`/tmp` 无
+    临时文件残留。
+  - 本次跑脚本发现并修好的两个脚本自身问题（不是产品 bug）：
+    (1) 预检只用 HTTP 探 `/`：网关对 `/` 返回 404，8000 端口已有
+    主聊天本地运行的真实网关在跑时仍被误判为空闲，健康检查误命中
+    旧服务、读不到本轮密钥文件而失败；已改为 TCP 级连接检测，
+    端口被占即明确失败并提示换端口。(2) 清理只杀 npm 包装进程：
+    `next start` 的子进程 `next-server` 会残留并继续占端口；已改
+    为 `setsid` 起服务 + 按进程组杀，复跑验证无残留。默认端口
+    8000/3000 被主聊天本地运行占用（真实网关 + 网页生产版，本次
+    未碰、未停），故实测用 8001/3001；默认端口直接跑会按设计在
+    预检失败退出。
+- 本阶段独立验证（本执行员实跑，命令与退出码）：
+  - `xvfb-run -a scripts/run_integration_test.sh` → **All tests passed，
+    exit 0**（1 个集成测试）
+  - `PAG_MOCK_PORT=8001 PAG_WEB_PORT=3001 scripts/e2e_web_smoke.sh`
+    → **9/9 步通过，exit 0**（两次运行：修脚本前第一次在预检与
+    残留上失败、修后第二次全过；见上）
+  - pytest 总数：**113 passed（102 旧 + 11 新），1 warning，exit 0**
+    （协调员重跑确认；新增 `tests/test_integration_stage_g.py` 9 个
+    + `tests/test_backup_rehearsal.py` 2 个，含 SQLite 恢复演练与真实
+    PG 16 恢复演练）。
+- 协调员独立复核（重跑，全部通过）：pytest 113 passed（见上）；
+  `PAG_MOCK_PORT=8002 xvfb-run -a scripts/run_integration_test.sh` →
+  All tests passed（1 个集成测试；用 8002 是因为主聊天本地运行占
+  着 8000/3000，未碰、未停）；`PAG_MOCK_PORT=8001 PAG_WEB_PORT=3001
+  scripts/e2e_web_smoke.sh` → 9/9 步通过；`flutter test` 24 passed、
+  `flutter analyze` 无问题；`npm test` 65 passed、typecheck/lint 均
+  exit 0；复核后 8001/8002/3001 无监听残留。
+- 本阶段发现并修好的真 bug：持久化非法预算值会让管理端 500——
+  `main.py` 的 `_effective_budgets` / `_effective_retention_days`
+  对 `system_settings` 做无保护的 `float()` / `int()`，坏行（如
+  `"not-a-number"`）会让 `GET /api/v1/admin/settings`、`/usage`、
+  `POST /api/v1/admin/backups` 全部 500，而 `/v1/*` 强制路径用的
+  `budgets.resolve_global_budgets` 本来就有容错、会正确回退到环境
+  变量。已修为与 `resolve_global_budgets` 同款语义（非数字或负数
+  忽略、用环境变量/默认值），`test_invalid_persisted_budget_falls_back_to_env_end_to_end`
+  把该行为钉住（修复前在 `GET settings` 处 500 失败）。
+- 口径说明（非 bug，不改行为）：任务书写的“撤销密钥后同密钥再调
+  返回 401”，网关实际行为是 **403 `client_disabled`**（密钥可识别
+  但已禁用），阶段 E 测试 `test_client_key_patch_revoke_regenerate`
+  已钉住同一 403；集成测试断言真实的 403。改口径须另定，不在本阶段
+  单方面改。
+- 已知缺口核对清单（本阶段逐项用 grep/读代码核实，绝无猜测）：
+  1. 备份文件未加密——**仍 open**。证据：`apps/api/gateway/backup.py`
+     docstring 明写 “Backups are NOT encrypted at rest in v1”；只有
+     0600 文件 / 0700 目录权限保护。
+  2. 登录限流与速率限制是进程内内存态——**仍 open**。证据：
+     `apps/api/gateway/main.py`：`app.state.rate_windows`（每客户
+     每分钟限流，:125/:191）、`app.state.login_attempts`（登录限流，
+     :127/:1014）、`app.state.semaphores`（并发信号量，:126/:201）
+     全是进程内 dict，多副本部署不共享。
+  3. 管理后台备份/改密 UI 缺失（只有后端接口）——**仍 open**。证据：
+     `apps/web/src/app/admin/` 下只有 diagnostics/keys/layout/login/
+     models/page/settings/usage，无 backups、改密页面；
+     `apps/web/src/lib/admin.ts` 无备份/改密方法（“password” 只出现
+     在 login 请求体里）；后端接口存在（`tests/test_security.py`、
+     `tests/test_backup.py` 覆盖）。
+  4. 审计表无自动清理——**仍 open**。证据：`AuditEvent` 只在
+     `main.py:266` 写入、`main.py:1837-1838` 列表查询，全仓库无
+     任何删除/清理审计行的代码；`retention_days` 设置只用于备份
+     文件裁剪与设置页展示。
+  5. 旧版 `GET /admin/budgets` 口径与持久化设置不一致——**仍 open**。
+     证据：`apps/api/gateway/budgets.py:154` 的 `budget_status`
+    （旧端点用）直接读环境变量 `settings.budget_global_*`；
+     `:22` 的 `resolve_global_budgets`（`/v1/*` 强制用）优先读
+     `system_settings` 持久化值、环境变量只作兜底。管理员在设置
+     页改了预算，旧端点仍报旧值。
+  6. 真实浏览器操作未验证（网页聊天与管理后台）——**仍 open**。
+     证据：`apps/web/package.json` 无 playwright/puppeteer 等浏览
+     器测试依赖；本阶段的网页验证是 curl + 生产构建（HTTP 层），
+     浏览器内安装/离线/SW 刷新/点击操作一律未验证，推迟到部署后。
+  7. 37 个二进制文件未进远端 develop——**仍 open**。证据：本地
+     `git ls-files` 核实共 36 个 Flutter 脚手架二进制文件
+     （android mipmap 5 + iOS 图标/启动图 18 + macOS 图标 7 +
+     flutter web 图标 5 + windows app_icon.ico 1）与
+     `apps/web/public/icon-180.png`（实测 180×180）均已在本地
+     跟踪；远端缺失是此前阶段快照推送记录（连接器只接受 UTF-8
+     文本），本地仓库未配 origin remote，本阶段未从远端复核，
+     仍待步骤 5 处理。
+  8. 真实 OpenAI 密钥缺失——**仍 open**。证据：本地 `.env` 只有
+     1 行 `GATEWAY_ADMIN_KEY`（主聊天本地运行用），无
+     `OPENAI_API_KEY`；`dev_mock_server.py` 用 `"mock-key-not-real"`；
+     本阶段全部验证均为 Mock 上游，真实模型验证与真实 Codex 测试
+     继续阻塞。
+  9. 并发限制确定性测试——**仍 open（无确定性覆盖）**。证据：
+     `tests/` 里无 `asyncio.gather` / 并发压测；`concurrency_limit`
+     只作为配置/字段值出现（`tests/conftest.py`、test_admin 字段
+     检查）。实现存在（每客户端 `asyncio.Semaphore`，
+     `main.py:201-205`，:626 强制），但“超限并发被挡住”没有能
+     稳定复现的测试，阶段 B 的备注至今有效。
+  10. 192/512 PWA 图标——**仍 open**。证据：
+      `apps/web/public/manifest.webmanifest`：180x180 与 192x192
+      两个条目都指向同一个 180px 文件 `/icon-180.png`（不是真正
+      的 192px 图），无 512 条目；`public/` 下只有 `icon-180.png`
+      与 `icon.svg`。
+  11. VersionBanner“有新版”刷新路径未实测——**仍 open**。证据：
+      `apps/web/src/components/VersionBanner.tsx:51` 的
+      `refreshForUpdate`（SKIP_WAITING + reload）存在，但全仓库
+      无任何测试引用 VersionBanner；mock 网关报告
+      `configured: false`，本阶段冒烟里横幅根本不渲染，“有新版”
+      分支从未被触发过。
+  12. 编辑/重新生成无服务端截断端点——**仍 open**。证据：网关
+      无 truncate/消息删除端点（全仓库 grep `truncat` 只命中
+      `logsafe.py` 的注释）；`apps/web/README.md` 已写明编辑/
+      重新生成只是本地截断、被取代消息仍在服务端历史里。
+  13. 增量同步/删除 tombstone/离线队列未实现——**仍 open**。证据：
+      `docs/ARCHITECTURE.md` §13.1 明写“未实现（不得谎称已有）”：
+      增量同步、删除 tombstone、离线缓存/草稿/待发送队列；当前
+      为全量拉取 + 服务端硬删除，离线时客户端无法同步。
+  14. iOS/macOS/Windows 安装包本地未编过（待 CI）——**仍 open**。
+      证据：本机无 Xcode（`which xcodebuild` 无结果）、本地无
+      `.github/workflows/` 目录（工作流文件须步骤 5 经浏览器建）；
+      阶段 C 集成测试只验证了 Linux 应用构建。
+  15. Docker Compose 容器验证本地未做——**仍 open**。证据：本机
+      `which docker` 无结果（未安装）；Compose 构建与容器健康检查
+      只能在目标服务器或有 Docker 的环境做。
+  16. 生产服务器 PG 备份/恢复未跑过——**仍 open**。证据：
+      `docs/BACKUP_RESTORE.md:81` 明写“生产服务器上的 PostgreSQL
+      备份/恢复流程未跑过（只有本机演练）；阶段 H 部署时须在服务
+      器上再跑一次真实备份 + 恢复核对”。
+  17. `npm audit` 未能运行——**仍 open**。证据：本阶段重跑
+      `cd apps/web && npm audit`（2026-11-14 01:07 UTC）仍为
+      403 `policy_denied`（`zz_managed_internal_spaces_package_registries`），
+      与阶段 F 同一原因，不是“干净”。
+  18. pip-audit 的 12 个漏洞是否仍只在 pip 本身——**已核实：是，
+      仍只在 pip 本身（缺口本身仍 open：未修）**。证据：本阶段重跑
+      `.venv/bin/python -m pip_audit` → “Found 12 known vulnerabilities
+      in 1 package”，全部是 pip 24.0（PYSEC-2026-1795/1796/2875/
+      2876/196/3721，修复版 25.3–26.2），运行依赖零漏洞。
+- 本阶段未验证的事项（不得谎称）：真实浏览器内操作（见缺口 6）；
+  真实 OpenAI 模型调用与真实 Codex 端到端（见缺口 8，密钥缺失）；
+  iOS/macOS/Windows 安装包（见缺口 14）；Docker Compose 容器
+  （见缺口 15）；生产服务器 PG 备份/恢复（见缺口 16）。本阶段其余
+  数字均由协调员独立重跑确认（见“协调员独立复核”）。
 
 ## 明确阻塞项（不得绕过、不得伪造）
 
