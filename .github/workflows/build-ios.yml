@@ -118,7 +118,7 @@ jobs:
             echo "::error::No .app found under build/ios/archive or build/ios/iphoneos"
             ls -R build/ios | head -n 50
             exit 1
-        fi
+          fi
           echo "Found app: $APP"
           rm -rf Payload "PersonalAI-${VERSION}-ios-unsigned.ipa"
           mkdir Payload
