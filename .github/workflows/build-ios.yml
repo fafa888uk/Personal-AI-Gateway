@@ -106,11 +106,19 @@ jobs:
         working-directory: apps/flutter
         run: |
           set -euo pipefail
-          APP="$(find build/ios/iphoneos -maxdepth 1 -name '*.app' -type d | head -n 1)"
-          if [ -z "$APP" ]; then
-            echo "::error::No .app found under build/ios/iphoneos"
-            exit 1
+          # flutter build ipa --no-codesign skips the IPA export and only
+           # produces an xcarchive (Flutter 3.50 build_ios.dart: with
+           # --no-codesign it returns right after the archive step), so the
+           # .app lives inside the xcarchive, not build/ios/iphoneos/.
+           APP="$(find build/ios/archive/Runner.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -type d | head -n 1)"
+           if [ -z "$APP" ]; then
+             APP="$(find build/ios/iphoneos -maxdepth 1 -name '*.app' -type d | head -n 1)"
           fi
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found under build/ios/archive or build/ios/iphoneos"
+            ls -R build/ios | head -n 50
+            exit 1
+        fi
           echo "Found app: $APP"
           rm -rf Payload "PersonalAI-${VERSION}-ios-unsigned.ipa"
           mkdir Payload
