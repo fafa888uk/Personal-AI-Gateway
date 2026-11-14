@@ -1,7 +1,7 @@
 name: personal_ai_gateway
 description: "Personal AI Gateway client — chat, models, usage and updates (iOS / Windows / macOS)."
 publish_to: 'none'
-version: 0.1.1+1
+version: 0.1.2+1
 
 environment:
   sdk: ^3.14.0
