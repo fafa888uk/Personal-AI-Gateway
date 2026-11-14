@@ -1,0 +1,202 @@
+# Personal AI Gateway — Build macOS (.dmg)
+#
+# 触发：版本标签 vX.Y.Z push、手动触发、Flutter 代码的 PR。
+# macOS Runner 编译 Flutter macOS 客户端，生成 .app，用 hdiutil 制作
+# .dmg，上传 Artifacts；打 tag 时同时上传 GitHub Release
+# （始终以 Draft 创建，绝不自动发布正式版）。
+# 版本号来源与 build-ios.yml 相同：tag vX.Y.Z 优先，否则
+# pubspec.yaml 版本 + "-dev.<短 SHA>"（明确标注开发构建）。
+# 未签名、未公证：发布说明中明确提示 macOS 安全验证限制（Gatekeeper
+# 默认拦截未签名应用，须右键打开或移除隔离属性；不绕过 macOS 安全机制）。
+# 诚实标记：未经真实 macOS 安装测试，产物一律标记“仅构建验证”
+# （build-only），绝不把打包成功写成安装成功。
+
+name: Build macOS (.dmg)
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths: ["apps/flutter/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: Resolve release version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag must be vX.Y.Z, got: $GITHUB_REF"
+              exit 1
+            fi
+            IS_RELEASE=true
+          else
+            BASE="$(python3 -c "import re; print(re.search(r'^version:\s*([0-9.]+)', open('apps/flutter/pubspec.yaml').read(), re.M).group(1))")"
+            VERSION="${BASE}-dev.${GITHUB_SHA::7}"
+            IS_RELEASE=false
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Version"
+            echo ""
+            echo "- Release version: \`$VERSION\`"
+            echo "- From tag release: \`$IS_RELEASE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build macOS .dmg
+    runs-on: macos-latest
+    needs: resolve-version
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Xcode version
+        run: xcodebuild -version
+      - name: Set up Flutter 3.50.0 (pinned — matches local ~/flutter)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.50.0"
+          channel: stable
+          cache: true
+      - name: Regenerate default Flutter scaffold assets
+        # The 36 default icon/splash binaries are NOT stored in git
+        # (snapshot pushes carry UTF-8 text only). Regenerate them
+        # here so the build runs on a complete tree. Verified
+        # locally: flutter create reproduces them byte-identical.
+        working-directory: apps/flutter
+        run: |
+          flutter create --org ai.personal.gateway --project-name personal_ai_gateway --platforms android,ios,linux,macos,web,windows .
+          test -f ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png
+          test -f macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_1024.png
+          test -f windows/runner/resources/app_icon.ico
+      - name: Flutter pub get
+        working-directory: apps/flutter
+        run: flutter pub get
+      - name: Build Flutter macOS Release
+        working-directory: apps/flutter
+        run: |
+          flutter build macos --release \
+            --build-name="$VERSION" --build-number="$GITHUB_RUN_NUMBER"
+      - name: Make .dmg with hdiutil
+        working-directory: apps/flutter
+        run: |
+          set -euo pipefail
+          APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -type d | head -n 1)"
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found under build/macos/Build/Products/Release"
+            exit 1
+          fi
+          echo "Found app: $APP"
+          test -f "$APP/Contents/Info.plist"
+          EXE="$(python3 -c "import plistlib; print(plistlib.load(open('$APP/Contents/Info.plist','rb')).get('CFBundleExecutable',''))")"
+          test -n "$EXE"
+          test -x "$APP/Contents/MacOS/$EXE"
+          test -s "$APP/Contents/MacOS/$EXE"
+          echo "Main executable: $EXE"
+          DMG="PersonalAI-${VERSION}-macos.dmg"
+          rm -f "$DMG"
+          hdiutil create -volname "Personal AI Gateway ${VERSION}" \
+            -srcfolder "$APP" -ov -format UDZO "$DMG"
+          ls -la "$DMG"
+      - name: Verify .dmg integrity
+        working-directory: apps/flutter
+        run: |
+          set -euo pipefail
+          DMG="PersonalAI-${VERSION}-macos.dmg"
+          test -s "$DMG"
+          hdiutil verify "$DMG"
+          MOUNT="$(hdiutil attach -readonly -nobrowse "$DMG" | grep -o '/Volumes/.*' | head -n 1)"
+          echo "Mounted at: $MOUNT"
+          ls "$MOUNT"
+          test -d "$MOUNT"/*.app
+          hdiutil detach "$MOUNT"
+          echo "DMG integrity check passed."
+      - name: SHA-256 checksums
+        working-directory: apps/flutter
+        run: |
+          set -euo pipefail
+          DMG="PersonalAI-${VERSION}-macos.dmg"
+          sha256sum "$DMG" > checksums.txt
+          cat checksums.txt
+          {
+            echo "## macOS build — $VERSION"
+            echo ""
+            echo "- Disk image: \`$DMG\`"
+            echo "- SHA-256: \`$(cut -d' ' -f1 checksums.txt)\`"
+            echo "- Signing: **unsigned, not notarized** — Gatekeeper will"
+            echo "  block it by default; open with right-click > Open."
+            echo "- Status: **build-only — 仅构建验证，未在真实 macOS 上安装、启动测试**"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload macOS .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # "build-only" is part of the artifact name on purpose: an
+          # untested build must never be mistaken for an install-tested one.
+          name: personal-ai-${{ needs.resolve-version.outputs.version }}-macos-dmg-build-only
+          path: |
+            apps/flutter/PersonalAI-${{ needs.resolve-version.outputs.version }}-macos.dmg
+            apps/flutter/checksums.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Upload .dmg to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [resolve-version, build]
+    if: needs.resolve-version.outputs.is_release == 'true'
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: personal-ai-${{ needs.resolve-version.outputs.version }}-macos-dmg-build-only
+          path: release-assets
+      - name: Upload to GitHub Release
+        run: |
+          set -euo pipefail
+          cd release-assets
+          TAG="${GITHUB_REF#refs/tags/}"
+          SHA="$(cut -d' ' -f1 checksums.txt)"
+          cat > NOTES.md <<EOF
+          # Personal AI Gateway $VERSION — macOS
+
+          **仅构建验证 (build-only)：** 此 DMG 仅在 GitHub Actions 上编译打包成功，
+          未在真实 macOS 上安装、启动测试过。打包成功不等于安装成功。
+
+          **未签名、未公证（macOS 安全验证限制）：** 本应用未经 Apple 签名与公证，
+          macOS Gatekeeper 默认会拦截打开（提示“无法验证开发者”）。
+          可右键点击应用选择“打开”来运行，或在确认来源后移除隔离属性。
+          本项目不绕过 macOS 安全机制；签名与公证条件满足后才会完善自动更新。
+
+          - 磁盘映像：\`PersonalAI-$VERSION-macos.dmg\`
+          - SHA-256：\`$SHA\`
+          - 更新信息以服务端 \`GET /api/v1/app/version\` 为准，须与本 Release 版本一致。
+          EOF
+          # Draft on purpose: a tag build must never auto-publish a
+          # formal release; publishing is a deliberate manual step.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "Personal AI Gateway $VERSION" --notes-file NOTES.md
+          fi
+          gh release upload "$TAG" "PersonalAI-$VERSION-macos.dmg" checksums.txt --clobber

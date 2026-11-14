@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { AdminClient, loginErrorMessage } from "@/lib/admin";
 import {
   Alert,
+  Notice,
   cardStyle,
   inputClass,
   inputStyle,
@@ -24,6 +25,20 @@ export default function AdminLoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [passwordChanged, setPasswordChanged] = useState(false);
+
+  // Set by the settings page after a successful password change
+  // (all sessions are revoked, so the admin must log in again).
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem("pag_password_changed") === "1") {
+        sessionStorage.removeItem("pag_password_changed");
+        setPasswordChanged(true);
+      }
+    } catch {
+      // Storage unavailable: no notice, login still works.
+    }
+  }, []);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -55,6 +70,12 @@ export default function AdminLoginPage() {
         <p className="mt-1 text-sm opacity-70">
           使用管理员账号登录 Personal AI Gateway
         </p>
+
+        {passwordChanged ? (
+          <div className="mt-4">
+            <Notice text="密码已修改，请使用新密码重新登录" />
+          </div>
+        ) : null}
 
         <label className="mt-6 block text-sm font-medium" htmlFor="admin-username">
           用户名
