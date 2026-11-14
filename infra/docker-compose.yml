@@ -1,0 +1,109 @@
+# Personal AI Gateway — production Compose (Spark server, stage H)
+#
+# Services: api (FastAPI gateway) + web (Next.js) + db (PostgreSQL 16)
+# + caddy (reverse proxy + automatic HTTPS for ai.fafa888.uk).
+# Data volumes (pgdata, caddy_data, caddy_config) persist across deploys.
+# NEVER run `docker compose down -v` or delete these volumes.
+#
+# Server-side env file: infra/.env (created by the admin on the server in
+# stage H — NEVER committed to the repo). Required keys:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+#   DATABASE_URL (e.g. postgresql://POSTGRES_USER:POSTGRES_PASSWORD@db:5432/POSTGRES_DB
+#   — host `db` is the compose service name; the gateway requires
+#   DATABASE_URL in production, it does not build one from POSTGRES_*),
+#   OPENAI_API_KEY (real key only; server-side injection, never in the image),
+#   ADMIN_USERNAME, ADMIN_PASSWORD, GATEWAY_ADMIN_KEY,
+#   APP_VERSION, APP_RELEASE_INFO_JSON (release info for
+#   GET /api/v1/app/version — update after each GitHub Release so the
+#   version endpoint matches the Release),
+#   NEXT_PUBLIC_GATEWAY_URL (e.g. https://ai.fafa888.uk),
+#   SESSION_COOKIE_SECURE=true, GATEWAY_ALLOW_MOCK_VERIFY=false.
+#
+# Port warning (docs/SERVER_ENV.md): the server's 80/443 are currently
+# held by the existing nginx (dy.fafa888.uk). Caddy needs 80/443 for
+# automatic HTTPS, so deploy-server.yml aborts if those ports are held by
+# anything other than this project's own Caddy. Do NOT stop the existing
+# nginx to force this through — the stage-H coexistence decision
+# (existing nginx reverse-proxies ai.fafa888.uk, or Caddy takes over)
+# must be made first.
+#
+# Image tags: PAG_API_TAG / PAG_WEB_TAG (set by deploy-server.yml to the
+# release version; default `latest` for local runs only).
+
+services:
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${PAG_API_TAG:-}
+    image: ghcr.io/fafa920q-hue/personal-ai-gateway-api:${PAG_API_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+    image: ghcr.io/fafa920q-hue/personal-ai-gateway-web:${PAG_WEB_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Backups land here (host: infra/backups) so pg_dump / pg_restore
+      # and the repo backup script can reach them from inside the container.
+      - ./backups:/backups
+    # PostgreSQL is NOT published to the host: only api reaches it.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

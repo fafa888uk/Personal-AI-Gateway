@@ -1,9 +1,10 @@
 # GitHub Actions 工作流（第二份指令）
 
-> 状态：**待创建**。工作流文件在阶段 5（Flutter 客户端与网页版之后）
-> 创建；且 GitHub App「Meta Muse AI」无 workflows 权限，
-> `.github/workflows/` 文件**不能经 API 推送**，须用浏览器网页编辑器
-> 创建（主聊天派浏览器任务）。本地只保留本说明，不得谎称工作流已上线。
+> 状态：**已写好、待浏览器创建**。5 个工作流文件已在本地分支
+> `feature/workflows` 写好并通过 YAML 校验；GitHub App「Meta Muse AI」
+> 无 workflows 权限，`.github/workflows/` 文件**不能经 API 推送**，
+> 须用浏览器网页编辑器创建（主聊天派浏览器任务）。在浏览器创建并
+> 验证前，不得谎称工作流已上线。
 
 ## 仓库与分支
 

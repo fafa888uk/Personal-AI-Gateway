@@ -351,6 +351,12 @@ sudo 或 docker 组成员身份），部署前先备份。
 
 ### G — 集成测试（2026-11-14 09:00–09:15 CST，本地分支 `feature/integration-tests`，从 Stage F `d29cfe7` 建出）
 
+- 提交：本地 `b6a1056`；远程 develop 快照
+  `2769e60d899d427abe89c73cc4ab9bc3ffc1b8e3`（215 个 UTF-8 文件，已验证
+  为 develop HEAD；37 个二进制文件未进快照——连接器只接受 UTF-8 文本，
+  与此前阶段同一已知缺口，步骤 5 处理）。同步记录见仓库外
+  `personal-ai-gateway.muse-github-snapshot-sync.json`（第 7 条记录）。
+
 - 任务 A：Flutter 集成测试。`xvfb-run -a scripts/run_integration_test.sh`
   （mock 网关实测：登录 → 列模型 → 建会话 → 流式发送 → 两端消息经
   API 核实落库）→ **All tests passed，exit 0**（1 个集成测试，约
@@ -512,6 +518,16 @@ sudo 或 docker 组成员身份），部署前先备份。
   （见缺口 15）；生产服务器 PG 备份/恢复（见缺口 16）。本阶段其余
   数字均由协调员独立重跑确认（见“协调员独立复核”）。
 
+### 步骤 5 — 工作流 + 真实构建（2026-11-14 09:20–进行中，本地分支 `feature/workflows`，从 Stage G `ab30e08` 建出）
+
+- 5 个工作流文件已在本地写好并通过 YAML 校验（`ci.yml`、`build-ios.yml`、`build-windows.yml`、`build-macos.yml`、`deploy-server.yml`），另新建 Docker/Compose 部署文件 8 个（`apps/api/Dockerfile`、`docker-entrypoint.sh`、`.dockerignore`；`apps/web/Dockerfile`、`.dockerignore`；`infra/docker-compose.yml`、`infra/Caddyfile`）。此前仓库无任何 Dockerfile/Compose/Caddyfile。
+- 关键约束：GitHub App / 连接器永远推不了 `.github/workflows/*` 文件，须分拆——工作流文件走浏览器网页编辑器建在分支上，其余文件走快照推送；分拆后核对树哈希与原始提交一致（LilaShift P5 验证过的做法）。
+- 37 个二进制文件：36 个 Flutter 脚手架资源已验证可用 `flutter create` 在 CI 里逐字节再生（`--org ai.personal.gateway --project-name personal_ai_gateway --platforms android,ios,linux,macos,web,windows`，Flutter 3.50.0；`ci.yml` 与三个构建工作流已加入该步骤并校验关键文件存在）；`apps/web/public/icon-180.png` 不可再生（本机渲染与原件 SHA-256 不一致），须走浏览器网页上传。
+- Release 一律以 Draft 创建（三个构建工作流的 `gh release create` 均加 `--draft`），绝不自动发布正式版；发布须人工确认。
+- 未验证的事项（不得谎称）：三个平台构建产物只能等 CI 真跑（本机无 Xcode/Windows 工具链）；Docker/Compose 本地未验证（本机无 Docker）；deploy 工作流未触发（按设计，部署是阶段 H 的事）；actionlint 本机没有，没跑。
+- 本地复核：pytest 112 passed + 1 skipped（跳过的是 PG 恢复演练，`pg_dump` 不在本机 PATH；与本次改动无关，改动只涉及工作流与 infra 文件）；YAML 6/6 解析通过。
+- 待办：浏览器创建 5 个工作流文件 + 上传 `icon-180.png` → 核对树哈希 → 开 Draft PR 跑 CI → 三平台构建产物 + SHA-256 → Draft Release → 版本接口验证。
+
 ## 明确阻塞项（不得绕过、不得伪造）
 
 1. **真实 OpenAI API 密钥没有。** 严禁复用其他对话/截图里出现过的
@@ -528,7 +544,7 @@ sudo 或 docker 组成员身份），部署前先备份。
    dy-family-network-xui-1）；部署网关时必须与它们共存、不得干扰。
    阶段 H 仍按门禁：测试全过才部署，部署前先做服务器环境检测
    （端口、磁盘、Docker、现有 443 占用）并先备份。
-3. **DNS 记录未创建。** `ai.fafa888.uk` A 记录由主聊天负责（见 `DNS.md`）。
+3. **DNS 记录已创建（2026-11-14 08:52，主聊天验证）。** `ai.fafa888.uk` A 记录 → 3.12.156.80，仅 DNS，TTL 自动；`dig @8.8.8.8` 已解析到 3.12.156.80（见 `DNS.md`）。
 4. **本地无 Docker；PostgreSQL 已有并已验证。** 本机实际有
    PostgreSQL 16 在线（5432 端口），阶段 F 已在真实 PG 上跑通
    Alembic 迁移与备份/恢复演练（见阶段 F 记录）。Compose 构建与

@@ -1,0 +1,18 @@
+# Personal AI Gateway — Caddy reverse proxy for ai.fafa888.uk
+# Automatic HTTPS (Let's Encrypt). API + gateway paths go to the api
+# service; everything else goes to the Next.js web service.
+# NOTE: this binds 80/443. The server currently runs an existing nginx on
+# those ports (dy.fafa888.uk) — see infra/docker-compose.yml header and
+# docs/SERVER_ENV.md. Do not deploy until the coexistence decision is made.
+ai.fafa888.uk {
+	encode zstd gzip
+
+	@api path /api/* /v1/*
+	handle @api {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}
