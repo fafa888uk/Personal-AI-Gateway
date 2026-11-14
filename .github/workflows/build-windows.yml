@@ -201,7 +201,7 @@ jobs:
       - name: Upload to GitHub Release
         run: |
           set -euo pipefail
-          cd release-assets
+          cd release-assets/apps/flutter
           TAG="${GITHUB_REF#refs/tags/}"
           SHA="$(cut -d' ' -f1 checksums.txt)"
           cat > NOTES.md <<EOF
@@ -219,4 +219,4 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --draft --title "Personal AI Gateway $VERSION" --notes-file NOTES.md
           fi
-          gh release upload "$TAG" "PersonalAI-$VERSION-windows-setup.exe" checksums.txt --clobber
+          gh release upload "$TAG" "installer-out/PersonalAI-$VERSION-windows-setup.exe" checksums.txt --clobber
