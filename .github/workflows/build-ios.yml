@@ -12,11 +12,10 @@
 #   - PR / 手动构建：apps/flutter/pubspec.yaml 的 version（当前 0.1.0，
 #     去掉 +build 号）+ "-dev.<短 SHA>"，并在产物名与发布说明中明确标注
 #     为开发构建。
-#   - 注意：仓库内版本目前不一致（Flutter 0.1.0、Web 0.1.0、网关
-#     apps/api/gateway/main.py 的 VERSION=0.3.0、pyproject 0.2.0），
-#     且尚无任何 git tag、无 VERSION 文件；第一次正式发版打 tag v0.1.0
-#     时应顺手统一各处版本。网关的 0.3.0 是网关内部 API 版本
-#     （/api/v1/app/version 返回的 gateway_version），不是发版版本。
+#   - 版本已统一为 0.1.0（2026-11-14）：网关 apps/api/gateway/main.py
+#     的 VERSION、pyproject、Flutter pubspec、Web package.json 均为
+#     0.1.0；tag v0.1.0 为唯一版本源；/api/v1/app/version 返回的
+#     gateway_version 即发版版本。
 #
 # 诚实标记：未经真机安装测试，产物一律标记“仅构建验证”
 # （build-only），绝不把打包成功写成设备安装成功。用户自签安装。
