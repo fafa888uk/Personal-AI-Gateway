@@ -147,6 +147,65 @@ sudo 或 docker 组成员身份），部署前先备份。
   离线队列未实现（当前为全量拉取 + 服务端硬删除），见
   `docs/ARCHITECTURE.md` §13.1。
 
+### D — 网页聊天（Next.js，2026-11-14 07:55–08:10 CST，本地分支 `feature/web-chat`）
+
+- 提交：`a7f289b`（Stage D 1/3：脚手架——Next.js 应用、网关客户端、
+  SSE、PWA 壳）与 `eca93f1`（Stage D 2/3：聊天 UI——流式、Markdown、
+  历史、用量、版本提示）。本地分支 `feature/web-chat`，从 main
+  `a3f4e8a` 建出；按分支模型走 feature → PR → develop → main。
+- 客户端（`apps/web` v0.1.0，Next.js 15.5.29 + React 19 + TypeScript +
+  Tailwind v4）：登录页（网关地址 + 客户端密钥，`GET /v1/models`
+  真实校验，凭据只存 localStorage）+ 聊天页（侧栏搜索/内联重命名/
+  两步删除/移动端抽屉、模型选择器、Markdown GFM + 代码高亮 + 复制、
+  流式输出 + Stop（AbortController）、重新生成、编辑重发、导出
+  Markdown/JSON、按消息 token 展示、错误卡片 + 重试、用量条、版本
+  横幅、浅色/深色主题、移动端布局）。只调网关，不存官方 Key。
+- 用量条：今日 + 本月来自 `GET /api/v1/usage/summary`；美元数字
+  仅当 `cost_status === "ok"` 时显示，否则只显示状态标签（与
+  Flutter 同一口径）。版本横幅：公开 `GET /api/v1/app/version`；
+  `configured: false` 时什么都不渲染；服务端 `web` 发行版更新时
+  显示版本号 + 说明 + “刷新获取新版”（SW SKIP_WAITING + reload）。
+- PWA：`public/manifest.webmanifest`、`public/sw.js`（缓存名
+  `pag-v1`；`/_next/static` 与图标缓存优先，`/api` 与导航网络优先，
+  绝不提供过期聊天数据；skipWaiting + clients.claim +
+  SKIP_WAITING 消息处理）、`public/icon-180.png`（实测 180×180）
+  + `public/icon.svg`；SW 只在生产环境注册（`src/app/init.tsx`）。
+- 编辑/重新生成诚实说明（已写进 `apps/web/README.md` 与
+  `src/app/chat/page.tsx` 页头注释，不改行为）：网关没有截断或
+  消息删除端点，编辑/重新生成只在本地截断/替换，新助手回复才
+  保存服务端；被取代的消息仍在服务端历史里，全量拉取后（如重载）
+  可能重新出现。服务端截断端点是 Stage E/Backlog 工作，不是本阶段。
+- 本阶段独立验证（2026-11-14 08:03–08:10 CST，验证代理重跑，
+  全部通过，命令与退出码）：
+  - `cd apps/web && npm run typecheck` → **exit 0**
+  - `cd apps/web && npm test` → **45 passed（7 文件），exit 0**
+  - `cd apps/web && npm run lint` → **exit 0**
+  - `cd apps/web && npm run build` → **exit 0**（`/` 106 kB、
+    `/chat` 208 kB 首屏 JS）
+  - `cd ~/workspace/personal-ai-gateway && ./.venv/bin/pytest tests/ -q`
+    → **36 passed，exit 0**（网关无改动，回归确认）
+  - 生产模式实测（`dev_mock_server.py` 真实网关 + Mock 上游，
+    临时种子密钥仅存 `/tmp`，验证后已删除；`npm run start` 端口
+    3000）：`/` 200、`/chat` 200、`/manifest.webmanifest` 200
+    （合法 JSON）、`/sw.js` 200；`GET /v1/models` 200
+    （`gpt-5.4-mini`，mock 已验证）；`POST /api/v1/chats` 201；
+    `POST /api/v1/chats/{id}/messages` 201（user）；`POST
+    /v1/chat/completions stream:true` 200 `text/event-stream`，
+    SSE 增量到达（含 usage 块 prompt 12 / completion 7 / total
+    19 与 `[DONE]`）；助手消息以 tokens 12/8 落库，
+    `GET .../messages` 200 确认 2 条；`GET /api/v1/usage/summary`
+    today/month 均 200（requests 1，`cost_status:
+    price_not_configured`，故用量条不显示美元数字——与规则一致）；
+    `GET /api/v1/app/version` 无鉴权 200（`configured: false`，
+    故版本横幅不渲染）。验证后两个服务器均已停，`/tmp` 密钥文件
+    已删，3000/8000 无监听残留。
+- 未验证（不得谎称）：浏览器内安装 / 离线 / SW 刷新流程**未验证**
+  ——验证代理无 live browser，需真实浏览器复核；`max-h-50`
+  文本框上限需目视确认；192/512 图标未做（manifest 的 192 条目
+  复用 180px PNG）；VersionBanner 的“有新版”刷新路径未实测
+  （mock 报告 `configured: false`）；全部验证均为 Mock 上游，
+  真实模型验证与真实 Codex 测试继续阻塞。
+
 ## 明确阻塞项（不得绕过、不得伪造）
 
 1. **真实 OpenAI API 密钥没有。** 严禁复用其他对话/截图里出现过的

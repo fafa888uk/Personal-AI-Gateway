@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Silver / dark-grey / light-purple system palette. */
+:root {
+  --background: #f6f7fb;
+  --foreground: #172033;
+  --surface: #ffffff;
+  --surface-muted: #eef0f6;
+  --border: #dde4ef;
+  --accent: #6d5ef9;
+  --accent-soft: #c9c2f5;
+  --accent-text: #4c3fd6;
+}
+
+.dark {
+  --background: #1c1c1e;
+  --foreground: #f2f2f7;
+  --surface: #2c2c2e;
+  --surface-muted: #3a3a3c;
+  --border: #48484a;
+  --accent: #8b7ff0;
+  --accent-soft: #c9c2f5;
+  --accent-text: #b3a9f7;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+/* Rendered assistant Markdown (MessageBubble). */
+.markdown p + p,
+.markdown p + ul,
+.markdown p + ol,
+.markdown ul + p,
+.markdown ol + p {
+  margin-top: 0.5rem;
+}
+.markdown ul,
+.markdown ol {
+  padding-left: 1.25rem;
+  margin-top: 0.5rem;
+}
+.markdown ul {
+  list-style: disc;
+}
+.markdown ol {
+  list-style: decimal;
+}
+.markdown li + li {
+  margin-top: 0.25rem;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  font-weight: 600;
+  margin: 0.75rem 0 0.25rem;
+}
+.markdown h1 {
+  font-size: 1.125rem;
+}
+.markdown h2 {
+  font-size: 1.05rem;
+}
+.markdown h3 {
+  font-size: 1rem;
+}
+.markdown code:not(pre code) {
+  background: var(--surface-muted);
+  border-radius: 0.375rem;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.85em;
+}
+.markdown pre {
+  margin-top: 0.5rem;
+  overflow-x: auto;
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+  background: var(--surface-muted);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+.markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+.markdown blockquote {
+  border-left: 3px solid var(--accent-soft);
+  padding-left: 0.75rem;
+  margin-top: 0.5rem;
+  opacity: 0.85;
+}
+.markdown table {
+  margin-top: 0.5rem;
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+}
+.markdown img {
+  max-width: 100%;
+  border-radius: 0.5rem;
+}
+.markdown hr {
+  border-color: var(--border);
+  margin: 0.75rem 0;
+}
