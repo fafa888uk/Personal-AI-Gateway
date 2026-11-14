@@ -15,8 +15,10 @@
   Stage B 快照已推 main，远程提交
   `a3f4e8a374a5ab3d3243dd1ae0b8347d652454c1`（2026-11-14 06:04，
   32 文件，已验证为 main HEAD，含网关 + 版本接口）。
-  同步记录见仓库外 `personal-ai-gateway.muse-github-snapshot-sync.json`
-  （2 条记录）。
+  Stage C/D/E 快照已推 develop（`7a61b545` / `919ad0df` /
+  `2c06762`）。同步记录见仓库外
+  `personal-ai-gateway.muse-github-snapshot-sync.json`
+  （5 条记录，Stage F 推送后追加第 6 条）。
 - 分支说明：Stage B 直接落在本地 main（分支模型建立前的启动例外）；
   从下一阶段起按 feature/* → PR → develop → main 走。
 
@@ -246,6 +248,11 @@ sudo 或 docker 组成员身份），部署前先备份。
   共享 `src/lib/admin.ts`（会话 Cookie `credentials: include`、CSRF
   自动获取、登录错误映射、成本标签、verified 判定仅
   `available + real`）。
+- 远程推送：Stage E 快照已推远程 `develop`，提交
+  `2c067624ca2bf66d470816e9aa2d5eac5086ca4a`（203 个 UTF-8 文件，已验证为
+  develop HEAD；37 个二进制文件未进快照——连接器只接受 UTF-8 文本，
+  与此前阶段同一已知缺口，步骤 5 处理）。同步记录见仓库外
+  `personal-ai-gateway.muse-github-snapshot-sync.json`（第 5 条记录）。
 - 协调员联调修复（本阶段关键发现）：后端与前端的响应信封形状不一致，
   前端原样直传会导致管理页空白/崩溃：模型行能力是嵌套 `capabilities`
   而非平铺 `cap_*`；`upstream_only` 是 `[{id}]` 对象而非字符串数组；
@@ -283,6 +290,60 @@ sudo 或 docker 组成员身份），部署前先备份。
   操作管理后台未验证（云端浏览器连不到本机 localhost，推迟到部署后，
   与网页聊天同一口径）。
 
+### F — 安全与备份（2026-11-14 08:36–09:00 CST，本地分支 `feature/security-backup`）
+
+- 提交：（待推送后填写）。本地分支 `feature/security-backup`，从
+  Stage E `68ab02a` 建出；按分支模型走 feature → develop 快照推送。
+- 预算接线（阶段 E 已知缺口已闭合）：`budgets.resolve_global_budgets`
+  读 `system_settings` 持久化值，环境变量为默认值/兜底；非法或负值
+  行被忽略、仍用环境变量；`check_budgets`（即 `/v1/*` 强制）改用有
+  效值。旧版 `GET /admin/budgets` 未改行为（仍报环境变量值），口径
+  不一致记为已知项。
+- 管理员凭据轮换：新增 `POST /api/v1/admin/change-password`（验旧
+  密码、新密码 ≥12 位且与旧不同、成功后撤销**全部**会话须重新登录）
+  与 `POST /api/v1/admin/sessions/revoke-all`；登录失败记审计
+  （用户名 + IP，不含密码；429 路径不写审计行，避免审计表被刷爆）。
+  全部管理变更操作（9 个变更端点逐个核对）均有 CSRF + 审计。
+- 密钥管理：客户端密钥创建/重新生成（只返回一次）/撤销已在阶段 E
+  完整；本阶段补管理员凭据轮换与会话撤销；数据库密码永不出现在
+  `pg_dump`/`pg_restore` 的 argv 里（剥离后走 `PGPASSWORD`，有测试）。
+- 备份：新模块 `apps/api/gateway/backup.py` + CLI
+  `scripts/backup_db.py`（`backup/list/restore/pg-dump`，系统
+  python3 可跑）+ 管理接口 `GET/POST /api/v1/admin/backups`
+  （SQLite 立即备份；PostgreSQL 返回 501 + 命令模板；恢复无 HTTP
+  接口，只走 CLI）。备份文件 0600、目录 0700、manifest 记 SHA-256；
+  保留按 `retention_days` 设置 + `BACKUP_RETENTION_COUNT`。
+- 恢复演练（真实跑过，见 `docs/BACKUP_RESTORE.md`）：SQLite
+  `scripts/restore_rehearsal.py` **12/12 通过**（丢失 + 损坏两阶段）；
+  PostgreSQL `scripts/restore_rehearsal_pg.py` **11/11 通过**（真实
+  PG 16：`pg_dump -Fc` → 删库 → `pg_restore` → 行数/抽查值/外键
+  全一致）。演练中发现并修好两个真问题：备份清单幽灵条目、硬编码
+  外键值的同批插入顺序（SQLite 因不强制外键才碰巧通过）。
+- 日志安全：新模块 `apps/api/gateway/logsafe.py`（`redact()` +
+  `RedactingFilter`，对最终渲染文本脱敏；`GATEWAY_LOG_FILE` 时加
+  10 MiB × 5 轮转文件日志）；请求日志本来就不存提示词。
+- 安全自查（见 `docs/SECURITY.md`）：CORS（API 无 CORS 头，同域
+  Caddy 部署才成立）、上游 URL 固定、密钥扫描干净、`.env.example`
+  死配置 `SESSION_SECRET` 已删；`pip-audit` 12 漏洞全在 pip 24.0
+  本身（运行依赖零漏洞，只报不修）；`npm audit` 因仓库策略 403
+  未能运行；`flutter pub audit` 无此子命令。
+- 附带修好：`requirements.txt` 缺 PostgreSQL 驱动（`psycopg` 未装
+  时 `postgresql://` 引擎建不出），已补 `psycopg[binary]>=3.2`；
+  Alembic `0001 → 0002 → 0003` 在真实 PostgreSQL 16 上跑通（含降级
+  再升级），“PG 迁移未实跑”缺口至此闭合；`gateway/__init__.py`
+  改懒加载，备份 CLI 用系统 python3 也能跑。
+- 本阶段独立验证（协调员重跑，全部通过）：
+  - `./.venv/bin/pytest tests/ -q` → **102 passed（71 旧 + 31 新），
+    1 warning（既有 Starlette 弃用警告），exit 0**
+  - `cd apps/web && npm test` → **65 passed，exit 0**（前端未改动，
+    回归确认）；`typecheck` / `lint` / `build` 均 exit 0
+  - 恢复演练：SQLite 12/12、PostgreSQL 11/11（见上）
+- 已知缺口（记入，不谎称完成）：备份文件未加密（只有权限保护）；
+  登录限流与速率限制是进程内内存态（多副本部署须改共享存储）；
+  管理后台的备份/改密 UI 未做（只有后端接口）；审计表无自动清理；
+  `npm audit` 未能运行（仓库策略 403）；生产服务器上的 PG 备份/
+  恢复流程未跑过（只有本机演练），阶段 H 须在服务器上再跑一次。
+
 ## 明确阻塞项（不得绕过、不得伪造）
 
 1. **真实 OpenAI API 密钥没有。** 严禁复用其他对话/截图里出现过的
@@ -300,8 +361,10 @@ sudo 或 docker 组成员身份），部署前先备份。
    阶段 H 仍按门禁：测试全过才部署，部署前先做服务器环境检测
    （端口、磁盘、Docker、现有 443 占用）并先备份。
 3. **DNS 记录未创建。** `ai.fafa888.uk` A 记录由主聊天负责（见 `DNS.md`）。
-4. **本地无 Docker/PostgreSQL。** Compose 构建与容器健康检查本地
-   无法验证，记为受限项。
+4. **本地无 Docker；PostgreSQL 已有并已验证。** 本机实际有
+   PostgreSQL 16 在线（5432 端口），阶段 F 已在真实 PG 上跑通
+   Alembic 迁移与备份/恢复演练（见阶段 F 记录）。Compose 构建与
+   容器健康检查本地仍无法验证，记为受限项。
 5. **原生 IPA 待 CI 验证。** 本机无 Xcode，本地编不出真 IPA；
    用户已确认自签（交付未签名包，用户用已有侧载方式自签安装）。
    构建验证在 CI macOS runner 上做，结论如实记录在

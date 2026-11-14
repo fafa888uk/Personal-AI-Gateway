@@ -215,9 +215,12 @@
   `apps/web/src/app/admin/*` 通过 `src/lib/admin.ts` 调用；该文件集中
   归一化后端响应信封（嵌套 capabilities/tokens、per_*/pricing_rules、
   `{id}` upstream 条目、cost 明细对象）为页面用的平铺形状——后端与
-  前端字段名不一致时只改归一化层，不改后端 API。已知缺口：持久化到
-  `system_settings` 的全局预算尚未接入 `/v1/*` 请求时强制（只上报），
-  接线是后续工作。
+  前端字段名不一致时只改归一化层，不改后端 API。【2026-11-14 阶段 F
+  已交付】持久化到 `system_settings` 的全局预算已接入 `/v1/*` 请求
+  时强制（环境变量仍为默认值/兜底）；管理后台新增改密、全部会话撤销、
+  备份清单/创建接口；日志脱敏 + 轮转；备份与恢复脚本 + 两次真实恢复
+  演练（SQLite 与 PostgreSQL，见 `docs/BACKUP_RESTORE.md`）；安全自查
+  见 `docs/SECURITY.md`。
 - 备份与恢复脚本 + 真实恢复演练（有证据的演练记录）。
 
 ## 10. 部署

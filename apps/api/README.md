@@ -56,6 +56,10 @@ Production uses PostgreSQL + Alembic — see "Migrations" below.
 | `GET /api/v1/admin/settings` | admin session | budgets, pricing, retention, version |
 | `PUT /api/v1/admin/settings` | admin session + CSRF | budgets/retention/pricing (validated) |
 | `GET /api/v1/admin/audit?limit=50` | admin session | recent audit events |
+| `POST /api/v1/admin/change-password` | admin session + CSRF | rotate admin password; revokes ALL sessions, re-login required |
+| `POST /api/v1/admin/sessions/revoke-all` | admin session + CSRF | revoke every admin session |
+| `GET /api/v1/admin/backups` | admin session | backup manifest (filenames, sizes, SHA-256 only) |
+| `POST /api/v1/admin/backups` | admin session + CSRF | create a SQLite backup now; PostgreSQL returns 501 + pg_dump command template |
 
 Verified by research (2026-11-14): cancel and compact are real
 OpenAI/Codex endpoints; no other cancel/compress endpoints are guessed.
@@ -73,9 +77,12 @@ OpenAI/Codex endpoints; no other cancel/compress endpoints are guessed.
 | `ADMIN_PASSWORD` | — | Admin console password. Only the Argon2id hash is stored; empty means no admin account is seeded and `/api/v1/admin/login` returns 503 `admin_not_configured`. Never log or commit it. |
 | `ADMIN_SESSION_HOURS` | `12` | Admin session lifetime in hours (cookie max-age + DB expiry) |
 | `SESSION_COOKIE_SECURE` | `false` | Set the `Secure` flag on the admin session cookie (HTTPS deployments: `true`) |
-| `BUDGET_GLOBAL_DAILY_USD` | `5` | Hard stop |
-| `BUDGET_GLOBAL_MONTHLY_USD` | `50` | Hard stop |
+| `BUDGET_GLOBAL_DAILY_USD` | `5` | Hard stop; overridden by persisted `system_settings` when set (Stage F) |
+| `BUDGET_GLOBAL_MONTHLY_USD` | `50` | Hard stop; overridden by persisted `system_settings` when set (Stage F) |
 | `BUDGET_CLIENT_MONTHLY_USD` | `20` | Hard stop, per client |
+| `BACKUP_DIR` | (next to DB) | Backup directory override (Stage F) |
+| `BACKUP_RETENTION_COUNT` | `30` | Max backups kept by count (Stage F) |
+| `GATEWAY_LOG_FILE` | — | Optional rotating file log (10 MiB x 5); empty = stdout only (Stage F) |
 | `CANDIDATE_MODELS` | (see `.env.example`) | Seeded into the registry as `pending` |
 | `UPSTREAM_TIMEOUT_S` | `120` | Gateway-enforced (not just httpx) timeout |
 | `DEFAULT_RATE_LIMIT_PER_MIN` | `60` | Per client key |
@@ -106,7 +113,10 @@ method (`real`) and time. It costs a tiny amount of API usage.
 ## Budgets
 
 Hard stops, checked before forwarding: global daily $5, global monthly
-$50, per-client monthly $20 (defaults from env). On hit, new requests get
+$50, per-client monthly $20 (defaults from env). Stage F: the global
+limits can be overridden in the admin console (`PUT
+/api/v1/admin/settings` → `system_settings`); the persisted values
+win and env vars are the fallback. On hit, new requests get
 HTTP 429 `budget_exceeded` and an audit event is recorded.
 
 Costs come only from real upstream `usage` + a `pricing_rules` row.
@@ -146,12 +156,17 @@ working only on legacy `/admin/*` and never authenticates the new API):
   key), daily trend, error distribution, and budget status with alerts.
 - `PUT /api/v1/admin/settings` persists global budgets and
   `retention_days` in `system_settings` and upserts pricing rules;
-  budgets must be ≥ 0, `retention_days` ≥ 1. Note: request-time budget
-  enforcement still reads the env defaults — the persisted values are
-  reported by the admin API; wiring enforcement to them is follow-up
-  work, not done here.
-- All admin changes (login/logout, model/key/settings changes,
-  verification, revoke/regenerate) write an `audit_events` row.
+  budgets must be ≥ 0, `retention_days` ≥ 1. Stage F: the persisted
+  global budgets are now enforced on `/v1/*` calls too (env vars
+  remain the defaults/fallback); legacy `GET /admin/budgets` still
+  reports the env values.
+- All admin changes (login/logout, failed logins, model/key/settings
+  changes, verification, revoke/regenerate, password change, session
+  revocation, backup creation) write an `audit_events` row.
+- `POST /api/v1/admin/change-password` rotates the admin password
+  (new password ≥ 12 chars, differs from the current one) and revokes
+  every session; `POST /api/v1/admin/sessions/revoke-all` revokes
+  every session without changing the password.
 
 ## Auth
 
@@ -192,6 +207,12 @@ The mock returns realistic Responses/Chat payloads, SSE, tool calls,
 usage and error cases. **Mock results are never real verification.**
 Real-upstream and real-Codex tests are blocked on a real key (Stage C).
 
+Stage F adds 31 tests (`tests/test_security.py` + `tests/test_backup.py`):
+persisted-budget enforcement on `/v1/*`, admin password rotation,
+session revocation, failed-login audit, log redaction, SQLite
+backup/restore/prune, pg_dump/pg_restore command safety, admin backup
+endpoints, backup CLI (incl. system-python run). Total: **102 tests**.
+
 ## Migrations
 
 Production path is Alembic + PostgreSQL; migrations contain no
@@ -204,6 +225,26 @@ DATABASE_URL=postgresql+psycopg://gateway:PW@db:5432/gateway \
 ```
 
 Local dev uses `Base.metadata.create_all` on startup (idempotent).
+
+PostgreSQL needs a driver: `requirements.txt` includes
+`psycopg[binary]>=3.2` (Stage F — it was missing before, so a
+`postgresql://` engine failed to construct). Migrations
+`0001 → 0002 → 0003` were verified against real PostgreSQL 16 locally
+(2026-11-14, Stage F), including downgrade to 0002 and re-upgrade.
+
+## Backup & restore (Stage F)
+
+Full procedure + rehearsal evidence: `docs/BACKUP_RESTORE.md`.
+
+- SQLite: `python3 scripts/backup_db.py backup|list|restore`
+  (system python3 works — the CLI does not need the venv).
+- PostgreSQL: `python3 scripts/backup_db.py pg-dump [--run]`;
+  passwords travel via `PGPASSWORD`, never argv.
+- Admin API: `GET /api/v1/admin/backups`,
+  `POST /api/v1/admin/backups` (SQLite only; PostgreSQL → 501).
+  Restore is CLI-only by design — never over HTTP onto a live DB.
+- Backups are chmod 0600, manifest records SHA-256; retention by
+  `retention_days` setting + `BACKUP_RETENTION_COUNT` env.
 
 ## Version endpoint
 

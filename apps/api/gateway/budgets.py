@@ -16,7 +16,45 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .config import Settings
-from .models import PricingRule, UsageRecord
+from .models import PricingRule, SystemSetting, UsageRecord
+
+
+def resolve_global_budgets(
+    session: Session, settings: Settings
+) -> tuple[float, float]:
+    """Effective global budget limits: persisted SystemSetting wins,
+    env Settings are the default/fallback.
+
+    A stored value that is missing, not a number, or negative is ignored
+    and the env default is used — a bad row can never disable the hard
+    stop or turn the limit negative.
+    """
+    daily = settings.budget_global_daily_usd
+    monthly = settings.budget_global_monthly_usd
+    try:
+        rows = (
+            session.query(SystemSetting)
+            .filter(
+                SystemSetting.key.in_(
+                    ["budget_global_daily_usd", "budget_global_monthly_usd"]
+                )
+            )
+            .all()
+        )
+    except Exception:
+        return daily, monthly
+    for row in rows:
+        try:
+            value = float(row.value)
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            continue
+        if row.key == "budget_global_daily_usd":
+            daily = value
+        elif row.key == "budget_global_monthly_usd":
+            monthly = value
+    return daily, monthly
 
 
 def compute_cost(
@@ -84,19 +122,25 @@ def spend_since(
 def check_budgets(
     session: Session, settings: Settings, client_key_id: int, client_monthly_usd: float
 ) -> tuple[bool, str]:
-    """Return (blocked, reason). Blocked means reject the new request."""
+    """Return (blocked, reason). Blocked means reject the new request.
+
+    Global limits come from resolve_global_budgets: the admin-persisted
+    SystemSetting values when present, env Settings as default/fallback.
+    Per-client monthly limit stays on the client key row.
+    """
     now = datetime.now(timezone.utc)
+    daily_limit, monthly_limit = resolve_global_budgets(session, settings)
     daily = spend_since(session, _day_start(now))
-    if daily >= settings.budget_global_daily_usd:
+    if daily >= daily_limit:
         return True, (
             f"global daily budget exceeded: spent ${daily:.4f} of "
-            f"${settings.budget_global_daily_usd:.2f}"
+            f"${daily_limit:.2f}"
         )
     monthly = spend_since(session, _month_start(now))
-    if monthly >= settings.budget_global_monthly_usd:
+    if monthly >= monthly_limit:
         return True, (
             f"global monthly budget exceeded: spent ${monthly:.4f} of "
-            f"${settings.budget_global_monthly_usd:.2f}"
+            f"${monthly_limit:.2f}"
         )
     client_monthly = spend_since(session, _month_start(now), client_key_id)
     if client_monthly >= client_monthly_usd:

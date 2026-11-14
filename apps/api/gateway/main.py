@@ -31,12 +31,14 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+from . import backup as backup_mod
 from . import budgets as budget_mod
 from .auth import (
     client_may_call_model,
     generate_client_key,
     generate_csrf_token,
     generate_session_token,
+    hash_admin_password,
     hash_client_key,
     hash_session_token,
     verify_admin_key,
@@ -45,6 +47,7 @@ from .auth import (
 )
 from .config import Settings, load_dotenv
 from .db import init_db, list_verified_models, resolve_model
+from .logsafe import configure_logging, log_file_from_env
 from .models import (
     AdminAccount,
     AdminSession,
@@ -69,6 +72,10 @@ from .upstream import (
 
 logger = logging.getLogger("gateway")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Stage F: every record the gateway logger emits passes the redacting
+# filter; when GATEWAY_LOG_FILE is set, a rotating file handler is
+# added (stdout behaviour is unchanged otherwise).
+configure_logging(logger, log_file_from_env())
 
 VERSION = "0.3.0"
 MAX_RETRIES = 2  # initial attempt + 2 retries, only before streaming starts
@@ -1121,6 +1128,11 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         account = db.query(AdminAccount).filter(AdminAccount.username == username).first()
         if account is None or not verify_admin_password(password, account.password_hash):
             _record_login_failure(key)
+            # Audit the failure (username + client IP only — never the
+            # password). At most 5 such rows per (IP, username) per
+            # 15-minute window: further attempts hit the 429 path, which
+            # deliberately writes no audit row (unbounded by design).
+            audit("admin_login_failed", f"username={username} ip={key[0]}")
             # Generic message: never reveal whether the username exists.
             return gateway_error(401, "invalid_admin_credentials", "invalid username or password")
         _clear_login_failures(key)
@@ -1150,6 +1162,69 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
         db.commit()
         audit("admin_logout", f"username={account.username}")
         resp = JSONResponse(content={"ok": True})
+        resp.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+        resp.delete_cookie(ADMIN_CSRF_COOKIE, path="/")
+        return resp
+
+    # ---- Stage F: admin credential rotation ----
+    @app.post("/api/v1/admin/change-password")
+    async def admin_change_password(request: Request, db: Session = Depends(get_db)):
+        """Rotate the single admin password (session + CSRF required).
+
+        Verifies the current password, stores only the new Argon2id
+        hash, and revokes EVERY session including the caller's — the
+        admin must log in again with the new password. This is the
+        rotation path for the admin credential; the env ADMIN_PASSWORD
+        is only a first-boot seed and never overwrites an existing
+        account (see db.seed_admin).
+        """
+        account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return gateway_error(400, "invalid_request", "request body must be a JSON object")
+        current = payload.get("current_password")
+        new = payload.get("new_password")
+        if not isinstance(current, str) or not current or not isinstance(new, str) or not new:
+            return gateway_error(400, "invalid_request", "current_password and new_password are required")
+        if not verify_admin_password(current, account.password_hash):
+            return gateway_error(401, "invalid_admin_credentials", "current password is incorrect")
+        if len(new) < 12:
+            return gateway_error(400, "invalid_request", "new password must be at least 12 characters")
+        if new == current:
+            return gateway_error(400, "invalid_request", "new password must differ from the current password")
+        account.password_hash = hash_admin_password(new)
+        db.query(AdminSession).filter(AdminSession.account_id == account.id).delete()
+        db.commit()
+        audit("admin_password_changed", f"username={account.username} sessions_revoked=all")
+        resp = JSONResponse(content={"ok": True})
+        resp.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+        resp.delete_cookie(ADMIN_CSRF_COOKIE, path="/")
+        return resp
+
+    @app.post("/api/v1/admin/sessions/revoke-all")
+    def admin_revoke_all_sessions(request: Request, db: Session = Depends(get_db)):
+        """Revoke every admin session (session + CSRF required).
+
+        The caller's session is revoked too: after this call the admin
+        must log in again. Use after a suspected session leak, or
+        together with a password change (change-password already does
+        this on its own).
+        """
+        account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        count = (
+            db.query(AdminSession)
+            .filter(AdminSession.account_id == account.id)
+            .count()
+        )
+        db.query(AdminSession).filter(AdminSession.account_id == account.id).delete()
+        db.commit()
+        audit("admin_sessions_revoked", f"username={account.username} revoked={count}")
+        resp = JSONResponse(content={"ok": True, "revoked": count})
         resp.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
         resp.delete_cookie(ADMIN_CSRF_COOKIE, path="/")
         return resp
@@ -1743,6 +1818,74 @@ def create_app(settings: Settings | None = None, transport: httpx.BaseTransport 
             {"id": r.id, "kind": r.kind, "detail": r.detail, "created_at": _iso(r.created_at)}
             for r in rows
         ]}
+
+    # ---- Stage F: backups ----
+    @app.get("/api/v1/admin/backups")
+    def admin_v1_list_backups(request: Request, db: Session = Depends(get_db)):
+        """List known backups from the manifest (admin session required).
+
+        The manifest records filenames, sizes and SHA-256 hashes only —
+        never key material. A missing manifest degrades to a directory
+        scan (entries without a hash cannot be verified on restore).
+        """
+        require_admin_session(request, db)
+        url = settings.effective_database_url
+        kind = "postgres" if url.startswith("postgres") else "sqlite"
+        backup_dir = backup_mod.resolve_backup_dir(settings.backup_dir or None, url)
+        backups = backup_mod.read_manifest(backup_dir) if backup_dir.exists() else []
+        return {"db_kind": kind, "backup_dir": str(backup_dir), "backups": backups}
+
+    @app.post("/api/v1/admin/backups")
+    def admin_v1_create_backup(request: Request, db: Session = Depends(get_db)):
+        """Create a backup now (admin session + CSRF required).
+
+        SQLite: online backup via the sqlite3 backup API, file chmod
+        0600, manifest updated, retention pruned from the persisted
+        `retention_days` setting. PostgreSQL: the API cannot run
+        pg_dump — it returns 501 with the exact command to run on the
+        server (database URL redacted; it comes from server env, never
+        from this response). Restore is CLI-only by design
+        (scripts/backup_db.py): restoring over a live database from an
+        HTTP call would be unsafe.
+        """
+        _account, session_row = require_admin_session(request, db)
+        require_csrf(request, session_row)
+        url = settings.effective_database_url
+        backup_dir = backup_mod.resolve_backup_dir(settings.backup_dir or None, url)
+        if url.startswith("postgres"):
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": {
+                        "message": (
+                            "PostgreSQL backup is not run from this API; "
+                            "run pg_dump on the server (see docs/BACKUP_RESTORE.md)"
+                        ),
+                        "type": "gateway_error",
+                        "code": "backup_postgres_manual",
+                    },
+                    # Deliberately a template: the real DATABASE_URL
+                    # (which may contain a password) is never echoed.
+                    "pg_dump_command": [
+                        "pg_dump", "--format=custom", "--no-owner",
+                        "--file", "<output.dump>", "<DATABASE_URL from server env>",
+                    ],
+                },
+            )
+        if not url.startswith("sqlite:///"):
+            return gateway_error(400, "backup_unsupported", f"unsupported database URL scheme: {url.split(':')[0]}")
+        db_path = url[len("sqlite:///"):]
+        if db_path == ":memory:":
+            return gateway_error(400, "backup_unsupported", "in-memory database cannot be backed up")
+        entry = backup_mod.create_sqlite_backup(
+            db_path,
+            backup_dir,
+            retention_days=_effective_retention_days(db),
+            retention_count=settings.backup_retention_count,
+            source="admin-api",
+        )
+        audit("backup_created", f"file={entry['filename']} size={entry['size_bytes']}")
+        return {"ok": True, "backup": entry}
 
     return app
 

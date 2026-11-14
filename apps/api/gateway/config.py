@@ -68,6 +68,10 @@ class Settings:
     max_request_bytes: int = 20 * 1024 * 1024
     default_rate_limit_per_min: int = 60
     default_concurrency_limit: int = 5
+    # Backups (Stage F): directory override; empty => next to the
+    # SQLite file (data/backups) or ./data/backups for PostgreSQL.
+    backup_dir: str = ""
+    backup_retention_count: int = 30
     # Test-only: allow /admin/models/{name}/verify with mode=mock.
     # Must stay false outside tests; mock verification is never real.
     allow_mock_verify: bool = False
@@ -116,6 +120,8 @@ class Settings:
             max_request_bytes=_int("MAX_REQUEST_BYTES", 20 * 1024 * 1024),
             default_rate_limit_per_min=_int("DEFAULT_RATE_LIMIT_PER_MIN", 60),
             default_concurrency_limit=_int("DEFAULT_CONCURRENCY_LIMIT", 5),
+            backup_dir=os.environ.get("BACKUP_DIR", ""),
+            backup_retention_count=_int("BACKUP_RETENTION_COUNT", 30),
             allow_mock_verify=os.environ.get(
                 "GATEWAY_ALLOW_MOCK_VERIFY", ""
             ).lower()
