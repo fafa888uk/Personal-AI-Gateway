@@ -1,0 +1,344 @@
+# Personal AI Gateway — Deploy server (GHCR images -> Spark server)
+#
+# 触发：仅版本标签 vX.Y.Z push 或手动触发。绝不在 PR / 分支 push 时运行。
+# 本步骤（步骤 5）不触发它：部署是阶段 H 的事，须满足阶段 H 门禁
+# （服务器 SSH 确认 + 全部测试通过 + 必要密钥就绪）才可手动/打 tag 触发。
+#
+# 部署审批（重要，先读）：
+#   deploy job 受 GitHub Environment `production` 保护。审批人必须事先在
+#   仓库 Settings > Environments > production 里配置 required reviewers；
+#   未配置则任何人都能触发，工作流本身无法替你配，也绝不伪造审批。
+#   审批通过前，deploy job 不会执行任何服务器操作。
+#
+# 流程：构建后端 + 网页镜像并推 GHCR -> SSH 到服务器 -> 预检（Docker、
+# 80/443 占用）-> 备份 PostgreSQL（pg_dump，验证备份可读）-> 记录当前
+# 镜像版本 -> 拉取新镜像并更新 Compose 服务 -> 健康检查 -> 失败自动
+# 回滚到上一可用镜像版本（只回滚镜像；数据库不自动恢复，见下）。
+#
+# 安全红线：
+#   - 永不删除持久化数据：任何步骤都不得用 `docker compose down -v`、
+#     `docker volume rm` 或删除数据卷；回滚也只换镜像。
+#   - OpenAI 密钥绝不进日志/镜像/源码：构建不传密钥 build-arg，不 echo
+#     环境、不把 secrets 写入文件；服务器上的密钥只存在服务器端
+#     infra/.env（阶段 H 由管理员在服务器上创建，永不进仓库），
+#     deploy 步骤只引用、不打印。
+#   - 数据库自动回滚不做：部署失败时只把镜像切回上一版本；若迁移已
+#     写入不兼容变更，须人工用部署前备份恢复（备份路径打印在日志里），
+#     自动恢复数据库可能丢数据。迁移必须向后兼容（见 ARCHITECTURE.md §10）。
+#
+# 已知前置阻塞（阶段 H 须先解决，见 docs/SERVER_ENV.md）：
+#   - 服务器 80/443 已被现有 nginx（dy.fafa888.uk）占用；本工作流的
+#     Caddy 也要 80/443 做自动 HTTPS。预检发现端口被非本项目 Caddy
+#     占用时会直接中止部署、绝不抢占或停掉现有 nginx；须先定好共存
+#     方案（现有 nginx 反代 ai.fafa888.uk，或 Caddy 接管）再部署。
+#   - ubuntu 用户须能访问 docker.sock（sudo 或 docker 组），否则预检失败。
+#   - 服务器端须事先存在部署目录与 infra/.env（见 infra/docker-compose.yml
+#     头注释列出的必填项）；缺失则部署中止。
+#
+# 需要的 secrets（仓库 Settings > Secrets and variables > Actions）：
+#   SSH_HOST、SSH_USER、SSH_PRIVATE_KEY（部署 SSH 私钥）。
+# 可选的 repository variable：DEPLOY_PATH（默认 /srv/personal-ai-gateway）。
+# GHCR 登录用内置 GITHUB_TOKEN（packages: write）。
+
+name: Deploy server
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-images:
+    name: Build + push GHCR images
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      api_image: ${{ steps.names.outputs.api_image }}
+      web_image: ${{ steps.names.outputs.web_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: Resolve release version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag must be vX.Y.Z, got: $GITHUB_REF"
+              exit 1
+            fi
+          else
+            # Manual (workflow_dispatch) run without a tag: dev image only,
+            # never tagged as a release version.
+            BASE="$(python3 -c "import re; print(re.search(r'^version:\s*([0-9.]+)', open('apps/flutter/pubspec.yaml').read(), re.M).group(1))")"
+            VERSION="${BASE}-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+      - id: names
+        name: Compute lowercase GHCR image names
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "api_image=ghcr.io/${OWNER}/personal-ai-gateway-api" >> "$GITHUB_OUTPUT"
+          echo "web_image=ghcr.io/${OWNER}/personal-ai-gateway-web" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/api
+          file: apps/api/Dockerfile
+          push: true
+          # No secrets here on purpose: OPENAI_API_KEY and friends are
+          # runtime env on the server only, never build args.
+          build-args: |
+            APP_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ steps.names.outputs.api_image }}:${{ steps.ver.outputs.version }}
+            ${{ steps.names.outputs.api_image }}:sha-${{ github.sha }}
+      - name: Build + push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/web
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.names.outputs.web_image }}:${{ steps.ver.outputs.version }}
+            ${{ steps.names.outputs.web_image }}:sha-${{ github.sha }}
+      - name: Verify pushed images exist and boot
+        run: |
+          set -euo pipefail
+          API="${{ steps.names.outputs.api_image }}:${{ steps.ver.outputs.version }}"
+          WEB="${{ steps.names.outputs.web_image }}:${{ steps.ver.outputs.version }}"
+          docker buildx imagetools inspect "$API"
+          docker buildx imagetools inspect "$WEB"
+          docker pull "$API"
+          docker run --rm "$API" python -c "import gateway.main; print('gateway version:', gateway.main.VERSION)"
+          # Web smoke test on port 3001 (3000 is taken by the local dev
+          # server on some machines; 3001 is the documented alt port).
+          docker pull "$WEB"
+          CID="$(docker run --rm -d -p 3001:3000 "$WEB")"
+          trap 'docker stop "$CID" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 24); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:3001/"; then
+              echo "Web image serves / on port 3001."
+              break
+            fi
+            if [ "$i" = 24 ]; then
+              echo "::error::Web image did not serve / within 120s."
+              docker logs "$CID" || true
+              exit 1
+            fi
+            sleep 5
+          done
+          {
+            echo "## Server images — ${{ steps.ver.outputs.version }}"
+            echo ""
+            echo "- API: \`$API\` (verified: imagetools inspect + import check)"
+            echo "- Web: \`$WEB\` (verified: imagetools inspect + serves / on 3001)"
+            echo "- No secret was passed as a build arg or printed in logs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Spark server (approval-gated)
+    runs-on: ubuntu-latest
+    needs: build-images
+    # Approval gate: configure required reviewers in
+    # Settings > Environments > production. Without that configuration
+    # this environment protects nothing — the workflow cannot fake it.
+    environment: production
+    env:
+      VERSION: ${{ needs.build-images.outputs.version }}
+      API_IMAGE: ${{ needs.build-images.outputs.api_image }}
+      WEB_IMAGE: ${{ needs.build-images.outputs.web_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Resolve deploy path + SSH target
+        run: |
+          DEPLOY_PATH="${{ vars.DEPLOY_PATH }}"
+          echo "DEPLOY_PATH=${DEPLOY_PATH:-/srv/personal-ai-gateway}" >> "$GITHUB_ENV"
+          echo "SSH_HOST=${{ secrets.SSH_HOST }}" >> "$GITHUB_ENV"
+          echo "SSH_USER=${{ secrets.SSH_USER }}" >> "$GITHUB_ENV"
+          if [ -z "${{ secrets.SSH_HOST }}" ] || [ -z "${{ secrets.SSH_USER }}" ]; then
+            echo "::error::SSH_HOST / SSH_USER secrets are not configured."
+            exit 1
+          fi
+      - name: Copy compose + Caddyfile to server
+        run: |
+          set -euo pipefail
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          ssh "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH/infra'"
+          scp infra/docker-compose.yml infra/Caddyfile "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/infra/"
+      - name: Preflight on server
+        run: |
+          set -euo pipefail
+          ssh "$SSH_USER@$SSH_HOST" bash -s _ "$DEPLOY_PATH" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          command -v docker >/dev/null || { echo "docker not found on server"; exit 1; }
+          docker compose version >/dev/null || { echo "docker compose not found on server"; exit 1; }
+          docker ps >/dev/null 2>&1 || { echo "cannot access docker.sock (need sudo or docker group)"; exit 1; }
+          test -f infra/.env || { echo "infra/.env missing on server (stage H must create it, never commit it)"; exit 1; }
+          # Port 80/443: occupied by existing nginx (dy.fafa888.uk) until
+          # the stage-H coexistence decision is made. Abort rather than
+          # never pre-empt or stop existing services. If our own Caddy is already
+          # running, the ports are ours and the check passes.
+          if docker compose -f infra/docker-compose.yml ps --status running --services 2>/dev/null | grep -qx caddy; then
+            echo "Own Caddy already running — ports 80/443 belong to this deployment."
+          else
+            for port in 80 443; do
+              if ss -tln | grep -q ":${port} "; then
+                echo "Port $port is already in use on this server (existing nginx / other service)."
+                ss -tlnp | grep ":${port} " || true
+                echo "Aborting deploy: resolve the 80/443 coexistence decision first (see deploy-server.yml header)."
+                exit 1
+              fi
+            done
+          fi
+          echo "Preflight passed."
+          REMOTE
+      - name: Record current images + back up database
+        run: |
+          set -euo pipefail
+          ssh "$SSH_USER@$SSH_HOST" bash -s _ "$DEPLOY_PATH" <<'REMOTE' > "$RUNNER_TEMP/deploy-pre-state.txt"
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          # Current running image tags (for rollback). "none" = first deploy.
+          for svc in api web; do
+            CID="$(docker compose -f infra/docker-compose.yml ps -q "$svc" 2>/dev/null | head -n 1 || true)"
+            if [ -n "$CID" ]; then
+              IMG="$(docker inspect --format '{{.Config.Image}}' "$CID")"
+              echo "PREV_${svc^^}_IMAGE=$IMG"
+              echo "PREV_${svc^^}_TAG=${IMG##*:}"
+            else
+              echo "PREV_${svc^^}_IMAGE=none"
+              echo "PREV_${svc^^}_TAG=none"
+            fi
+          done
+          # Back up PostgreSQL before touching anything (skip on first
+          # deploy when no db container exists yet). Credentials come from
+          # the server-side infra/.env only; never printed.
+          if docker compose -f infra/docker-compose.yml ps -q db 2>/dev/null | grep -q .; then
+            mkdir -p infra/backups
+            TS="$(date +%Y%m%d%H%M%S)"
+            PGUSER="$(grep -E '^POSTGRES_USER=' infra/.env | cut -d= -f2-)"
+            PGDB="$(grep -E '^POSTGRES_DB=' infra/.env | cut -d= -f2-)"
+            export PGPASSWORD="$(grep -E '^POSTGRES_PASSWORD=' infra/.env | cut -d= -f2-)"
+            docker compose -f infra/docker-compose.yml exec -T db \
+              pg_dump -U "$PGUSER" -d "$PGDB" -Fc > "infra/backups/pre-deploy-$TS.dump"
+            test -s "infra/backups/pre-deploy-$TS.dump"
+            docker compose -f infra/docker-compose.yml exec -T db \
+              pg_restore -l "/backups/pre-deploy-$TS.dump" >/dev/null
+            echo "BACKUP_FILE=infra/backups/pre-deploy-$TS.dump"
+            echo "Database backup verified: infra/backups/pre-deploy-$TS.dump"
+          else
+            echo "BACKUP_FILE=none (first deploy, no database yet)"
+          fi
+          REMOTE
+          cat "$RUNNER_TEMP/deploy-pre-state.txt"
+          {
+            echo "PREV_API_TAG=$(grep '^PREV_API_TAG=' "$RUNNER_TEMP/deploy-pre-state.txt" | cut -d= -f2- || echo none)"
+            echo "PREV_WEB_TAG=$(grep '^PREV_WEB_TAG=' "$RUNNER_TEMP/deploy-pre-state.txt" | cut -d= -f2- || echo none)"
+            echo "BACKUP_FILE=$(grep '^BACKUP_FILE=' "$RUNNER_TEMP/deploy-pre-state.txt" | cut -d= -f2- || echo none)"
+          } >> "$GITHUB_ENV"
+      - name: Pull new images + update services
+        run: |
+          set -euo pipefail
+          ssh "$SSH_USER@$SSH_HOST" bash -s _ "$DEPLOY_PATH" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"; VERSION="$2"
+          cd "$DEPLOY_PATH"
+          export PAG_API_TAG="$VERSION" PAG_WEB_TAG="$VERSION"
+          docker compose -f infra/docker-compose.yml pull api web
+          docker compose -f infra/docker-compose.yml up -d
+          echo "Services updated to $VERSION."
+          REMOTE
+      - name: Health check (new version)
+        run: |
+          set -euo pipefail
+          ssh "$SSH_USER@$SSH_HOST" bash -s _ "$DEPLOY_PATH" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          # Wait for compose healthchecks (api: /api/health, web: /).
+          for i in $(seq 1 24); do
+            API_H="$(docker compose -f infra/docker-compose.yml ps api --format '{{.Health}}' 2>/dev/null || true)"
+            WEB_H="$(docker compose -f infra/docker-compose.yml ps web --format '{{.Health}}' 2>/dev/null || true)"
+            if [ "$API_H" = "healthy" ] && [ "$WEB_H" = "healthy" ]; then
+              echo "api=$API_H web=$WEB_H"
+              break
+            fi
+            if [ "$i" = 24 ]; then
+              echo "Health check timed out (api=$API_H web=$WEB_H)."
+              docker compose -f infra/docker-compose.yml ps
+              docker compose -f infra/docker-compose.yml logs --tail=100 api web || true
+              exit 1
+            fi
+            sleep 5
+          done
+          # Explicit endpoint checks inside the containers.
+          docker compose -f infra/docker-compose.yml exec -T api python -c \
+            "import urllib.request, json; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=10)); assert d.get('status')=='ok', d; print('api /api/health:', d)"
+          docker compose -f infra/docker-compose.yml exec -T web node -e \
+            "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok) process.exit(1); console.log('web / status:', r.status)}).catch(e=>{console.error(e); process.exit(1)})"
+          echo "Health check passed."
+          REMOTE
+      - name: Roll back to previous images on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "Deploy failed — rolling back to previous images (database is NOT auto-restored; see header)."
+          ssh "$SSH_USER@$SSH_HOST" bash -s _ "$DEPLOY_PATH" "$PREV_API_TAG" "$PREV_WEB_TAG" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"; PREV_API_TAG="$2"; PREV_WEB_TAG="$3"
+          cd "$DEPLOY_PATH"
+          if [ "$PREV_API_TAG" = "none" ] || [ "$PREV_WEB_TAG" = "none" ]; then
+            echo "First deploy failed — no previous images to roll back to. Stopping new services; data volumes untouched."
+            docker compose -f infra/docker-compose.yml stop api web || true
+            exit 0
+          fi
+          export PAG_API_TAG="$PREV_API_TAG" PAG_WEB_TAG="$PREV_WEB_TAG"
+          docker compose -f infra/docker-compose.yml up -d api web
+          for i in $(seq 1 24); do
+            API_H="$(docker compose -f infra/docker-compose.yml ps api --format '{{.Health}}' 2>/dev/null || true)"
+            WEB_H="$(docker compose -f infra/docker-compose.yml ps web --format '{{.Health}}' 2>/dev/null || true)"
+            if [ "$API_H" = "healthy" ] && [ "$WEB_H" = "healthy" ]; then
+              echo "Rollback healthy (api=$API_H web=$WEB_H)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Rollback health check did not pass — manual intervention required. Data volumes were NOT deleted."
+          docker compose -f infra/docker-compose.yml ps
+          exit 1
+          REMOTE
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "## Deploy — $VERSION"
+            echo ""
+            echo "- Images: \`$API_IMAGE:$VERSION\`, \`$WEB_IMAGE:$VERSION\`"
+            echo "- Database backup before deploy: \`${BACKUP_FILE:-unknown}\`"
+            echo "- Previous images: api=\`${PREV_API_TAG:-none}\`, web=\`${PREV_WEB_TAG:-none}\`"
+            echo "- Health: api /api/health ok, web / ok"
+            echo "- After a Release, update the server release info"
+            echo "  (APP_VERSION / APP_RELEASE_INFO_JSON in infra/.env) so"
+            echo "  \`GET /api/v1/app/version\` matches this Release."
+          } >> "$GITHUB_STEP_SUMMARY"

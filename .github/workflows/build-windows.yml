@@ -1,0 +1,222 @@
+# Personal AI Gateway — Build Windows installer (.exe)
+#
+# 触发：版本标签 vX.Y.Z push、手动触发、Flutter 代码的 PR。
+# Windows Runner 构建 Flutter Windows Release，运行时与依赖一同打包，
+# 用 Inno Setup 制作完整安装程序，输出 .exe，上传 Artifacts；
+# 打 tag 时同时上传 GitHub Release（始终以 Draft 创建，不自动发布正式版）。
+# 版本号来源与 build-ios.yml 相同：tag vX.Y.Z 优先，否则
+# pubspec.yaml 版本 + "-dev.<短 SHA>"（明确标注开发构建）。
+# 诚实标记：未经真实 Windows 安装测试，产物一律标记“仅构建验证”
+# （build-only），绝不把打包成功写成安装成功。
+
+name: Build Windows installer
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths: ["apps/flutter/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: Resolve release version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag must be vX.Y.Z, got: $GITHUB_REF"
+              exit 1
+            fi
+            IS_RELEASE=true
+          else
+            BASE="$(python3 -c "import re; print(re.search(r'^version:\s*([0-9.]+)', open('apps/flutter/pubspec.yaml').read(), re.M).group(1))")"
+            VERSION="${BASE}-dev.${GITHUB_SHA::7}"
+            IS_RELEASE=false
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Version"
+            echo ""
+            echo "- Release version: \`$VERSION\`"
+            echo "- From tag release: \`$IS_RELEASE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+    needs: resolve-version
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Flutter 3.50.0 (pinned — matches local ~/flutter)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.50.0"
+          channel: stable
+          cache: true
+      - name: Regenerate default Flutter scaffold assets
+        # The 36 default icon/splash binaries are NOT stored in git
+        # (snapshot pushes carry UTF-8 text only). Regenerate them
+        # here so the build runs on a complete tree. Verified
+        # locally: flutter create reproduces them byte-identical.
+        working-directory: apps/flutter
+        run: |
+          flutter create --org ai.personal.gateway --project-name personal_ai_gateway --platforms android,ios,linux,macos,web,windows .
+          if (-not (Test-Path ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png)) { Write-Error "Regenerated iOS icon missing"; exit 1 }
+          if (-not (Test-Path macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_1024.png)) { Write-Error "Regenerated macOS icon missing"; exit 1 }
+          if (-not (Test-Path windows/runner/resources/app_icon.ico)) { Write-Error "Regenerated Windows icon missing"; exit 1 }
+      - name: Flutter pub get
+        working-directory: apps/flutter
+        run: flutter pub get
+      - name: Build Flutter Windows Release
+        working-directory: apps/flutter
+        run: flutter build windows --release --build-name="$env:VERSION" --build-number="$env:GITHUB_RUN_NUMBER"
+      - name: Stage runtime + dependencies
+        working-directory: apps/flutter
+        run: |
+          $releaseDir = "build/windows/x64/runner/Release"
+          if (-not (Test-Path "$releaseDir/personal_ai_gateway.exe")) {
+            Write-Error "Built exe not found under $releaseDir"
+            exit 1
+          }
+          Remove-Item -Recurse -Force staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item -Recurse -Force "$releaseDir/*" staging/
+          Get-ChildItem staging | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Build installer with Inno Setup
+        working-directory: apps/flutter
+        run: |
+          # The .iss script is generated here (not a repo file) so the
+          # installer definition stays inside this workflow.
+          $iss = @'
+          [Setup]
+          AppName=Personal AI Gateway
+          AppVersion=__VERSION__
+          AppPublisher=Personal AI Gateway
+          DefaultDirName={autopf}\Personal AI Gateway
+          DefaultGroupName=Personal AI Gateway
+          OutputDir=installer-out
+          OutputBaseFilename=PersonalAI-__VERSION__-windows-setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          UninstallDisplayIcon={app}\personal_ai_gateway.exe
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+          [Files]
+          Source: "staging\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Icons]
+          Name: "{group}\Personal AI Gateway"; Filename: "{app}\personal_ai_gateway.exe"
+          Name: "{autodesktop}\Personal AI Gateway"; Filename: "{app}\personal_ai_gateway.exe"; Tasks: desktopicon
+          [Run]
+          Filename: "{app}\personal_ai_gateway.exe"; Description: "{cm:LaunchProgram,Personal AI Gateway}"; Flags: nowait postinstall skipifsilent
+          '@
+          $iss = $iss.Replace('__VERSION__', $env:VERSION)
+          # Inno Setup script files must be plain ASCII: any non-ASCII
+          # byte breaks ISCC, so the script above is English-only.
+          $iss | Out-File -FilePath installer.iss -Encoding ascii
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            Write-Error "ISCC not found at $iscc"
+            exit 1
+          }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer-out | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+      - name: Verify installer and SHA-256 checksums
+        working-directory: apps/flutter
+        run: |
+          $exe = "installer-out/PersonalAI-$env:VERSION-windows-setup.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Installer not found: $exe"
+            exit 1
+          }
+          $size = (Get-Item $exe).Length
+          if ($size -le 0) {
+            Write-Error "Installer is empty: $exe"
+            exit 1
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          "$hash  PersonalAI-$env:VERSION-windows-setup.exe" | Out-File -FilePath checksums.txt -Encoding ascii
+          Get-Content checksums.txt
+          @"
+          ## Windows build — $env:VERSION
+
+          - Installer: ``PersonalAI-$env:VERSION-windows-setup.exe`` ($size bytes, Inno Setup)
+          - SHA-256: ``$hash``
+          - Status: **build-only — 仅构建验证，未在真实 Windows 上安装、启动测试**
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # "build-only" is part of the artifact name on purpose: an
+          # untested build must never be mistaken for an install-tested one.
+          name: personal-ai-${{ needs.resolve-version.outputs.version }}-windows-setup-build-only
+          path: |
+            apps/flutter/installer-out/PersonalAI-${{ needs.resolve-version.outputs.version }}-windows-setup.exe
+            apps/flutter/checksums.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Upload installer to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [resolve-version, build]
+    if: needs.resolve-version.outputs.is_release == 'true'
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: personal-ai-${{ needs.resolve-version.outputs.version }}-windows-setup-build-only
+          path: release-assets
+      - name: Upload to GitHub Release
+        run: |
+          set -euo pipefail
+          cd release-assets
+          TAG="${GITHUB_REF#refs/tags/}"
+          SHA="$(cut -d' ' -f1 checksums.txt)"
+          cat > NOTES.md <<EOF
+          # Personal AI Gateway $VERSION — Windows
+
+          **仅构建验证 (build-only)：** 此安装程序仅在 GitHub Actions 上编译打包成功，
+          未在真实 Windows 上安装、启动测试过。打包成功不等于安装成功。
+
+          - 安装程序：\`PersonalAI-$VERSION-windows-setup.exe\`（Inno Setup，含运行时与依赖）
+          - SHA-256：\`$SHA\`
+          - 更新信息以服务端 \`GET /api/v1/app/version\` 为准，须与本 Release 版本一致。
+          EOF
+          # Draft on purpose: a tag build must never auto-publish a
+          # formal release; publishing is a deliberate manual step.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "Personal AI Gateway $VERSION" --notes-file NOTES.md
+          fi
+          gh release upload "$TAG" "PersonalAI-$VERSION-windows-setup.exe" checksums.txt --clobber
