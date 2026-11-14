@@ -17,7 +17,7 @@ import 'screens/version_screen.dart';
 
 /// This build's version (matches pubspec.yaml). Used only to compare
 /// against the server-reported per-platform versions.
-const String kAppVersion = '0.1.0';
+const String kAppVersion = '0.1.1';
 
 void main() {
   runApp(const GatewayApp());
