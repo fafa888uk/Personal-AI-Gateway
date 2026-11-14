@@ -199,6 +199,43 @@ export function loginErrorMessage(err: unknown): string {
   return "登录失败，请重试";
 }
 
+/** Minimum new-password length, mirroring the backend rule. */
+export const MIN_ADMIN_PASSWORD_LENGTH = 12;
+
+/**
+ * Client-side validation for the change-password form. Returns the
+ * first problem as a readable message, or null when the input is
+ * acceptable. Mirrors the backend rules (new password >= 12 chars,
+ * different from the current one) so the user gets feedback without
+ * a round trip; the backend still enforces them.
+ */
+export function validatePasswordChange(
+  currentPassword: string,
+  newPassword: string,
+  confirmPassword: string,
+): string | null {
+  if (!currentPassword) return "请填写现密码";
+  if (!newPassword) return "请填写新密码";
+  if (newPassword.length < MIN_ADMIN_PASSWORD_LENGTH)
+    return `新密码至少 ${MIN_ADMIN_PASSWORD_LENGTH} 位`;
+  if (newPassword === currentPassword) return "新密码不能与现密码相同";
+  if (newPassword !== confirmPassword) return "两次输入的新密码不一致";
+  return null;
+}
+
+/**
+ * Change-password failure message. 401 means the current password is
+ * wrong; anything else is shown exactly as the backend reported it.
+ */
+export function changePasswordErrorMessage(err: unknown): string {
+  if (err instanceof AdminError) {
+    if (err.status === 401) return "现密码不正确，请重试";
+    return err.message;
+  }
+  if (err instanceof Error) return err.message;
+  return "修改密码失败，请重试";
+}
+
 /**
  * Cost-status label for the admin usage dashboard. Only "exact" is a
  * complete total; anything else is a partial sum and must be labelled
@@ -581,6 +618,20 @@ export class AdminClient {
 
   async logout(): Promise<void> {
     await this.jsonRequest("POST", "/api/v1/admin/logout");
+    this.csrfToken = null;
+    this.csrfPromise = null;
+  }
+
+  /**
+   * Rotate the admin password. The backend revokes EVERY session
+   * (including this one) and clears the session cookies, so the
+   * caller must send the user back to /admin/login afterwards.
+   */
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    await this.jsonRequest("POST", "/api/v1/admin/change-password", {
+      current_password: currentPassword,
+      new_password: newPassword,
+    });
     this.csrfToken = null;
     this.csrfPromise = null;
   }

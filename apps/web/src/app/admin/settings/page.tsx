@@ -1,8 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
-import { AdminClient } from "@/lib/admin";
+import {
+  AdminClient,
+  changePasswordErrorMessage,
+  validatePasswordChange,
+} from "@/lib/admin";
 import type { AdminSettings, PricingRule } from "@/lib/admin";
 import {
   Alert,
@@ -28,6 +33,7 @@ function numberOrNull(value: string): number | null {
  * the version/release info reported by GET /api/v1/app/version.
  */
 export default function AdminSettingsPage() {
+  const router = useRouter();
   const [settings, setSettings] = useState<AdminSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -38,6 +44,12 @@ export default function AdminSettingsPage() {
   const [monthlyBudget, setMonthlyBudget] = useState("");
   const [retentionDays, setRetentionDays] = useState("");
   const [pricing, setPricing] = useState<PricingRule[]>([]);
+
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [pwError, setPwError] = useState<string | null>(null);
+  const [pwSaving, setPwSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -89,6 +101,38 @@ export default function AdminSettingsPage() {
           : rule,
       ),
     );
+  }
+
+  /**
+   * Rotate the admin password. The backend revokes every session
+   * (including this one), so on success the form is cleared and the
+   * user is sent back to /admin/login with a flag for the
+   * "use the new password" notice.
+   */
+  async function submitPasswordChange() {
+    setPwError(null);
+    const validation = validatePasswordChange(currentPw, newPw, confirmPw);
+    if (validation) {
+      setPwError(validation);
+      return;
+    }
+    setPwSaving(true);
+    try {
+      await new AdminClient().changePassword(currentPw, newPw);
+      setCurrentPw("");
+      setNewPw("");
+      setConfirmPw("");
+      try {
+        sessionStorage.setItem("pag_password_changed", "1");
+      } catch {
+        // Storage unavailable: the login page simply shows no notice.
+      }
+      router.replace("/admin/login");
+    } catch (err) {
+      setPwError(changePasswordErrorMessage(err));
+    } finally {
+      setPwSaving(false);
+    }
   }
 
   const version = settings?.version as
@@ -205,6 +249,63 @@ export default function AdminSettingsPage() {
           {saving ? "保存中…" : "保存全部设置"}
         </button>
       </div>
+
+      <Card title="修改密码">
+        <p className="text-sm opacity-70">
+          修改后将吊销全部登录会话（含当前会话），须使用新密码重新登录。新密码至少 12 位。
+        </p>
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <label className="text-sm font-medium">
+            现密码
+            <input
+              className={`${inputClass} mt-1`}
+              style={inputStyle}
+              type="password"
+              autoComplete="current-password"
+              value={currentPw}
+              onChange={(e) => setCurrentPw(e.target.value)}
+            />
+          </label>
+          <label className="text-sm font-medium">
+            新密码
+            <input
+              className={`${inputClass} mt-1`}
+              style={inputStyle}
+              type="password"
+              autoComplete="new-password"
+              value={newPw}
+              onChange={(e) => setNewPw(e.target.value)}
+            />
+          </label>
+          <label className="text-sm font-medium">
+            确认新密码
+            <input
+              className={`${inputClass} mt-1`}
+              style={inputStyle}
+              type="password"
+              autoComplete="new-password"
+              value={confirmPw}
+              onChange={(e) => setConfirmPw(e.target.value)}
+            />
+          </label>
+        </div>
+        {pwError ? (
+          <div className="mt-3">
+            <Alert text={pwError} />
+          </div>
+        ) : null}
+        <div className="mt-3">
+          <button
+            type="button"
+            disabled={pwSaving}
+            onClick={() => void submitPasswordChange()}
+            className={primaryButtonClass}
+            style={primaryButtonStyle()}
+          >
+            {pwSaving ? "正在修改…" : "修改密码"}
+          </button>
+        </div>
+      </Card>
 
       <Card title="版本与发布信息">
         {settings == null ? (

@@ -10,8 +10,10 @@ import {
   AdminError,
   adminCostIsExact,
   adminCostStatusLabel,
+  changePasswordErrorMessage,
   isModelVerified,
   loginErrorMessage,
+  validatePasswordChange,
   verificationBadgeLabel,
 } from "../admin";
 import type { AdminModel } from "../admin";
@@ -363,5 +365,106 @@ describe("backend response normalization (real gateway shapes)", () => {
     expect(rows[0].client_name).toBe("codex");
     expect(rows[0].error).toBe("upstream_500");
     expect(rows[0].status).toBe("500");
+  });
+});
+
+describe("AdminClient.changePassword", () => {
+  it("POSTs current/new passwords with CSRF + credentials:include", async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        if (url.endsWith("/api/v1/admin/csrf")) {
+          return jsonResponse(200, { csrf_token: "csrf-1" });
+        }
+        if (url.endsWith("/api/v1/admin/change-password")) {
+          const headers = new Headers(init?.headers);
+          expect(init?.method).toBe("POST");
+          expect(init?.credentials).toBe("include");
+          expect(headers.get("X-CSRF-Token")).toBe("csrf-1");
+          expect(headers.get("Content-Type")).toBe("application/json");
+          expect(JSON.parse(String(init?.body ?? "{}"))).toEqual({
+            current_password: "old-password-123",
+            new_password: "new-password-456",
+          });
+          return jsonResponse(200, { ok: true });
+        }
+        return jsonResponse(404, { error: { message: "not found" } });
+      }),
+    );
+    await new AdminClient("http://localhost:8000").changePassword(
+      "old-password-123",
+      "new-password-456",
+    );
+    // CSRF fetched once, then the mutation.
+    expect(calls).toHaveLength(2);
+    expect(calls[0].url).toBe("http://localhost:8000/api/v1/admin/csrf");
+    expect(calls[1].url).toBe(
+      "http://localhost:8000/api/v1/admin/change-password",
+    );
+  });
+
+  it("surfaces a wrong current password as a 401 AdminError", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.endsWith("/api/v1/admin/csrf")) {
+          return jsonResponse(200, { csrf_token: "csrf-1" });
+        }
+        return jsonResponse(401, {
+          error: {
+            code: "invalid_admin_credentials",
+            message: "current password is incorrect",
+          },
+        });
+      }),
+    );
+    await expect(
+      new AdminClient("http://localhost:8000").changePassword(
+        "wrong-password-1",
+        "new-password-456",
+      ),
+    ).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_admin_credentials",
+      message: "current password is incorrect",
+    });
+  });
+
+  it("validatePasswordChange rejects empty/short/same/mismatched input", () => {
+    expect(validatePasswordChange("", "new-password-456", "new-password-456")).toBe(
+      "请填写现密码",
+    );
+    expect(validatePasswordChange("old-password-123", "", "")).toBe("请填写新密码");
+    expect(validatePasswordChange("old-password-123", "short", "short")).toBe(
+      "新密码至少 12 位",
+    );
+    expect(
+      validatePasswordChange("same-password-1", "same-password-1", "same-password-1"),
+    ).toBe("新密码不能与现密码相同");
+    expect(
+      validatePasswordChange("old-password-123", "new-password-456", "different-789012"),
+    ).toBe("两次输入的新密码不一致");
+    expect(
+      validatePasswordChange("old-password-123", "new-password-456", "new-password-456"),
+    ).toBeNull();
+  });
+
+  it("changePasswordErrorMessage maps 401 and passes other backend messages through", () => {
+    expect(
+      changePasswordErrorMessage(
+        new AdminError("current password is incorrect", "invalid_admin_credentials", 401),
+      ),
+    ).toBe("现密码不正确，请重试");
+    expect(
+      changePasswordErrorMessage(
+        new AdminError(
+          "new password must be at least 12 characters",
+          "invalid_request",
+          400,
+        ),
+      ),
+    ).toBe("new password must be at least 12 characters");
   });
 });

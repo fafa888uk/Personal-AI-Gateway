@@ -77,7 +77,7 @@ def test_version_configured(tmp_path):
     body = resp.json()
     assert body["configured"] is True
     assert body["version"] == "1.0.0"
-    assert body["gateway_version"] == "0.1.4"
+    assert body["gateway_version"] == "0.1.5"
     assert set(body["platforms"]) == {"ios", "windows", "macos", "web"}
     ios = body["platforms"]["ios"]
     assert ios["download_url"].endswith("PersonalAI-1.0.0-ios-unsigned.ipa")
